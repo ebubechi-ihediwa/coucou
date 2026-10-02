@@ -411,6 +411,9 @@ export class Island {
         State.notify();
       })
       .catch((err) => {
+        // Nothing was copied, so the original path must not stay as the chat's file.
+        State.droppedFile = null;
+        State.promptContext = null;
         UploadSeq.deactivate();
         State.noteMessage = String(err).replace(/^Error:\s*/, "");
         this.engine.animateMorph(0);
