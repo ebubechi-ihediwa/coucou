@@ -71,8 +71,11 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
     onHeightChange();
 
     const file = State.droppedFile;
+    // The file rides along until a question has been answered. Counting messages
+    // instead would lose it after a failed first attempt, whose bubble stays.
+    const firstTurn = !State.chatHistory.some((m) => m.role === "assistant");
     const context: ChatContext | null =
-      State.chatHistory.length === 1 && file ? { kind: "file", name: file.name, path: file.path } : null;
+      firstTurn && file ? { kind: "file", name: file.name, path: file.path } : null;
 
     try {
       const reply = await Bridge.chatSend(query, context);

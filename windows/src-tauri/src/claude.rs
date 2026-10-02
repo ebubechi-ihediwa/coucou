@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::{files, log, secrets};
+use crate::{files, http, log, secrets};
 
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -159,38 +159,65 @@ pub async fn send(
 }
 
 async fn call(key: &str, body: &Value) -> Result<Value, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(90))
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let response = client
-        .post(ENDPOINT)
-        .header("x-api-key", key)
-        .header("anthropic-version", ANTHROPIC_VERSION)
-        .header("anthropic-beta", FALLBACK_BETA)
-        .header("content-type", "application/json")
-        .json(body)
-        .send()
+    let client = http::chat_client().map_err(|e| chat_error(&e))?;
+    call_at(&client, ENDPOINT, key, body, &http::CHAT_RETRY)
         .await
-        .map_err(|e| format!("Network error: {e}"))?;
+        .map_err(|e| chat_error(&e))
+}
 
-    let status = response.status();
-    let text = response.text().await.map_err(|e| e.to_string())?;
-    if !status.is_success() {
-        // Surface the API's own message, which is what makes a bad key obvious.
-        let detail = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| {
-                v.get("error")
-                    .and_then(|e| e.get("message"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| text.chars().take(200).collect());
-        return Err(format!("Claude API {status}: {detail}"));
+/// One message request. A message changes nothing on the server, so the
+/// transient failures (rate limit, overload, no connection) are asked again a
+/// couple of times; a bad key, a bad request or a timeout are not.
+async fn call_at(
+    client: &reqwest::Client,
+    endpoint: &str,
+    key: &str,
+    body: &Value,
+    retry: &http::Retry,
+) -> Result<Value, http::ApiError> {
+    let key = http::secret(key)?;
+    let bytes = http::send_retrying(
+        || {
+            client
+                .post(endpoint)
+                .header("x-api-key", key.clone())
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .header("anthropic-beta", FALLBACK_BETA)
+                .json(body)
+        },
+        http::CHAT_MAX_BODY,
+        retry,
+    )
+    .await?;
+    serde_json::from_slice(&bytes).map_err(|_| http::ApiError::Malformed)
+}
+
+/// What the note view says when a chat request fails: which kind of failure it
+/// was and what to do about it, never the key, the URL or the raw body.
+fn chat_error(err: &http::ApiError) -> String {
+    use http::ApiError::*;
+    match err {
+        Status { code: 401, .. } => "API key rejected (401). Check it in Settings.".into(),
+        Status { code: 403, message, .. } => match message {
+            Some(m) => format!("Claude refused this request (403): {m}"),
+            None => "Claude refused this request (403). The key may lack access to this model.".into(),
+        },
+        Status { code: 429, retry_after, .. } => match retry_after {
+            Some(wait) => format!("Claude is rate limiting requests (429). Try again in {} s.", wait.as_secs().max(1)),
+            None => "Claude is rate limiting requests (429). Try again in a minute.".into(),
+        },
+        Status { code, .. } if *code >= 500 => {
+            format!("Claude is overloaded or unavailable ({code}). Try again in a moment.")
+        }
+        // The API's own words are what explain a bad request or an unknown model.
+        Status { code, message: Some(m), .. } => format!("Claude API {code}: {m}"),
+        Status { code, .. } => format!("Claude API {code}"),
+        Timeout => "Claude took too long to answer. Try again.".into(),
+        Connect => "No connection. Check your network and try again.".into(),
+        Transport => "The connection to Claude broke. Try again.".into(),
+        TooLarge => "Claude's reply was too large to read.".into(),
+        Malformed => "Bad API response.".into(),
     }
-    serde_json::from_str(&text).map_err(|e| format!("Bad API response: {e}"))
 }
 
 /// PDF → document block, image → image block, text/code → inline text.
@@ -303,6 +330,157 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    // ── The API call itself, against a local server (no live service) ────────
+
+    use crate::http::tests::{reply, run, Mock, Script};
+    use crate::http::{ApiError, Retry};
+    use serde_json::json;
+    use std::time::Duration;
+
+    const QUICK: Retry = Retry {
+        max_retries: 2,
+        base: Duration::from_millis(10),
+        cap: Duration::from_millis(40),
+        deadline: Duration::from_secs(10),
+    };
+
+    fn client(ms: u64) -> reqwest::Client {
+        crate::http::build_client(Duration::from_millis(ms)).unwrap()
+    }
+
+    const OK: &str = r#"{"content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn"}"#;
+
+    #[test]
+    fn a_message_request_carries_the_documented_headers_and_returns_the_reply() {
+        run(async {
+            let mock = Mock::start(vec![reply(200, OK)]).await;
+            let body = json!({ "model": "claude-opus-5", "max_tokens": 8, "messages": [] });
+            let value = super::call_at(&client(2000), &mock.url("/v1/messages"), "sk-test-key", &body, &QUICK)
+                .await
+                .unwrap();
+            assert_eq!(value["content"][0]["text"], "hello");
+            let seen = mock.seen_headers(0);
+            assert_eq!(seen.get("x-api-key").map(String::as_str), Some("sk-test-key"));
+            assert_eq!(seen.get("anthropic-version").map(String::as_str), Some("2023-06-01"));
+            assert!(seen.contains_key("anthropic-beta"));
+            assert_eq!(seen.get("content-type").map(String::as_str), Some("application/json"));
+        });
+    }
+
+    #[test]
+    fn every_failure_kind_reads_differently_and_leaks_nothing() {
+        let status = |code, message: Option<&str>, retry_after| ApiError::Status {
+            code,
+            message: message.map(String::from),
+            retry_after,
+        };
+        let cases = [
+            (status(401, Some("invalid x-api-key sk-test-key"), None), "API key rejected (401). Check it in Settings."),
+            (status(403, None, None), "Claude refused this request (403). The key may lack access to this model."),
+            (status(429, None, Some(Duration::from_secs(12))), "Claude is rate limiting requests (429). Try again in 12 s."),
+            (status(429, None, None), "Claude is rate limiting requests (429). Try again in a minute."),
+            (status(529, None, None), "Claude is overloaded or unavailable (529). Try again in a moment."),
+            (status(400, Some("max_tokens: must be positive"), None), "Claude API 400: max_tokens: must be positive"),
+            (status(404, Some("model: claude-nope"), None), "Claude API 404: model: claude-nope"),
+            (status(413, None, None), "Claude API 413"),
+            (ApiError::Timeout, "Claude took too long to answer. Try again."),
+            (ApiError::Connect, "No connection. Check your network and try again."),
+            (ApiError::Transport, "The connection to Claude broke. Try again."),
+            (ApiError::TooLarge, "Claude's reply was too large to read."),
+            (ApiError::Malformed, "Bad API response."),
+        ];
+        for (err, expected) in cases {
+            let shown = super::chat_error(&err);
+            assert_eq!(shown, expected);
+            assert!(!shown.contains("sk-test-key"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn auth_and_invalid_requests_are_surfaced_once_without_retries() {
+        run(async {
+            let body = json!({});
+            let unauthorised = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
+            let mock = Mock::start(vec![reply(401, unauthorised)]).await;
+            let err = super::call_at(&client(2000), &mock.url("/"), "k", &body, &QUICK).await.unwrap_err();
+            assert_eq!(super::chat_error(&err), "API key rejected (401). Check it in Settings.");
+            assert_eq!(mock.hits(), 1);
+
+            let invalid = r#"{"type":"error","error":{"type":"invalid_request_error","message":"model: claude-nope"}}"#;
+            let mock = Mock::start(vec![reply(400, invalid)]).await;
+            let err = super::call_at(&client(2000), &mock.url("/"), "k", &body, &QUICK).await.unwrap_err();
+            assert_eq!(super::chat_error(&err), "Claude API 400: model: claude-nope");
+            assert_eq!(mock.hits(), 1);
+        });
+    }
+
+    #[test]
+    fn overload_and_rate_limits_are_retried_a_bounded_number_of_times() {
+        run(async {
+            let body = json!({});
+            // Overloaded, then fine: the user never sees the blip.
+            let mock = Mock::start(vec![reply(529, "{}"), reply(200, OK)]).await;
+            super::call_at(&client(2000), &mock.url("/"), "k", &body, &QUICK).await.unwrap();
+            assert_eq!(mock.hits(), 2);
+
+            // Overloaded for good: 1 try + 2 retries, then a clear message.
+            let mock = Mock::start(vec![reply(529, "{}")]).await;
+            let err = super::call_at(&client(2000), &mock.url("/"), "k", &body, &QUICK).await.unwrap_err();
+            assert_eq!(mock.hits(), 3);
+            assert_eq!(super::chat_error(&err), "Claude is overloaded or unavailable (529). Try again in a moment.");
+
+            // Rate limited with a long Retry-After: reported with the wait, not slept through.
+            let limited = Script::Reply { status: 429, headers: vec![("retry-after", "120".into())], body: b"{}".to_vec() };
+            let mock = Mock::start(vec![limited]).await;
+            let err = super::call_at(&client(2000), &mock.url("/"), "k", &body, &QUICK).await.unwrap_err();
+            assert_eq!(mock.hits(), 1);
+            assert_eq!(super::chat_error(&err), "Claude is rate limiting requests (429). Try again in 120 s.");
+        });
+    }
+
+    #[test]
+    fn timeouts_connection_failures_and_bad_bodies_do_not_hang_or_crash() {
+        run(async {
+            let body = json!({});
+            // Never answers: a timeout, and not asked twice.
+            let mock = Mock::start(vec![Script::Hang]).await;
+            let err = super::call_at(&client(150), &mock.url("/"), "k", &body, &QUICK).await.unwrap_err();
+            assert_eq!(err, ApiError::Timeout);
+            assert_eq!(mock.hits(), 1);
+
+            // Cannot reach the service at all (`.invalid` never resolves).
+            let err = super::call_at(&client(5000), "http://coucou-test.invalid/", "k", &body, &QUICK).await.unwrap_err();
+            assert_eq!(super::chat_error(&err), "No connection. Check your network and try again.");
+
+            // A 200 that is not JSON.
+            let mock = Mock::start(vec![reply(200, "<html>captive portal</html>")]).await;
+            let err = super::call_at(&client(2000), &mock.url("/"), "k", &body, &QUICK).await.unwrap_err();
+            assert_eq!(super::chat_error(&err), "Bad API response.");
+        });
+    }
+
+    #[test]
+    fn the_next_message_works_after_a_failed_one() {
+        run(async {
+            let body = json!({});
+            let mock = Mock::start(vec![reply(401, "{}"), Script::Hangup, reply(200, OK)]).await;
+            let c = client(2000);
+            assert!(super::call_at(&c, &mock.url("/"), "k", &body, &QUICK).await.is_err());
+            assert!(super::call_at(&c, &mock.url("/"), "k", &body, &QUICK).await.is_err());
+            assert!(super::call_at(&c, &mock.url("/"), "k", &body, &QUICK).await.is_ok());
+        });
+    }
+
+    #[test]
+    fn a_key_with_a_stray_newline_is_a_bad_key_not_a_network_error() {
+        run(async {
+            let mock = Mock::start(vec![reply(200, OK)]).await;
+            let err = super::call_at(&client(2000), &mock.url("/"), "sk-abc\n", &json!({}), &QUICK).await.unwrap_err();
+            assert_eq!(super::chat_error(&err), "API key rejected (401). Check it in Settings.");
+            assert_eq!(mock.hits(), 0, "nothing is sent with a key that cannot be carried");
+        });
     }
 
     #[test]

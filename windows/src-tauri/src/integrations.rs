@@ -8,19 +8,27 @@
 // Nothing is polled until its key exists in the Credential Manager, and no
 // request goes anywhere the user has not configured.
 
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
+use reqwest::header::AUTHORIZATION;
+use reqwest::{Client, RequestBuilder};
 use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::http::{self, ApiError};
 use crate::island::WINDOW_LABEL;
 use crate::log;
 use crate::secrets;
 
-const TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a rate-limited integration is left alone when the service did not say
+/// ("Retry-After" wins when it did), and the longest we will hold off.
+const DEFAULT_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+const MAX_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 
 /// What the island receives. `event` is only set when something actually changed,
 /// which is what drives the pill badge and the sound.
@@ -45,11 +53,117 @@ fn emit(app: &AppHandle, update: IntegrationUpdate) {
     let _ = app.emit_to(WINDOW_LABEL, "integration", update);
 }
 
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(TIMEOUT)
-        .build()
-        .unwrap_or_default()
+/// Every poll below goes through `fetch`/`try_fetch`: one shared client with a
+/// timeout that cannot silently vanish, a size limit on what is read back, and a
+/// real error — never an empty "success" — when the answer is not usable.
+async fn try_fetch(
+    build: impl FnOnce(&Client) -> Result<RequestBuilder, ApiError>,
+) -> Result<Value, ApiError> {
+    let client = http::poll_client()?;
+    http::send_json(build(&client)?, http::POLL_MAX_BODY).await
+}
+
+/// `try_fetch`, reporting a failure to the island (and the log) before giving up.
+async fn fetch(
+    app: &AppHandle,
+    id: &'static str,
+    forbidden: &str,
+    build: impl FnOnce(&Client) -> Result<RequestBuilder, ApiError>,
+) -> Option<Value> {
+    match try_fetch(build).await {
+        Ok(json) => Some(json),
+        Err(err) => {
+            fail(app, id, &err, forbidden);
+            None
+        }
+    }
+}
+
+fn fail(app: &AppHandle, id: &'static str, err: &ApiError, forbidden: &str) {
+    let message = err.describe(forbidden);
+    log::line(format!("{id}: {message}"));
+    if err.code() == Some(429) {
+        GATE.lock().unwrap().cool_down(id, err.retry_after(), Instant::now());
+    }
+    emit(
+        app,
+        IntegrationUpdate { id, data: json!({}), error: Some(message), event: None },
+    );
+}
+
+/// Who may poll right now. One poll per integration at a time (a Refresh button
+/// pressed over and over must not pile up requests), and none while a service has
+/// told us to back off.
+#[derive(Default)]
+struct Gate {
+    running: HashSet<&'static str>,
+    cooling_until: HashMap<&'static str, Instant>,
+}
+
+#[derive(Debug, PartialEq)]
+enum Entry {
+    Go,
+    /// Already polling.
+    Busy,
+    /// Rate limited; this much longer.
+    Cooling(Duration),
+}
+
+impl Gate {
+    fn enter(&mut self, id: &'static str, now: Instant) -> Entry {
+        if let Some(until) = self.cooling_until.get(id).copied() {
+            if until > now {
+                return Entry::Cooling(until - now);
+            }
+            self.cooling_until.remove(id);
+        }
+        if self.running.insert(id) {
+            Entry::Go
+        } else {
+            Entry::Busy
+        }
+    }
+
+    fn leave(&mut self, id: &'static str) {
+        self.running.remove(id);
+    }
+
+    fn cool_down(&mut self, id: &'static str, retry_after: Option<Duration>, now: Instant) {
+        let wait = retry_after.unwrap_or(DEFAULT_COOLDOWN).min(MAX_COOLDOWN);
+        self.cooling_until.insert(id, now + wait);
+    }
+}
+
+static GATE: LazyLock<Mutex<Gate>> = LazyLock::new(|| Mutex::new(Gate::default()));
+
+/// Releases the integration's slot when the poll ends, however it ends.
+struct Running(&'static str);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        GATE.lock().unwrap().leave(self.0);
+    }
+}
+
+/// Runs `poll` unless the integration is already polling or cooling down. A manual
+/// refresh during a cooldown is told so instead of being ignored.
+async fn guarded(app: &AppHandle, id: &'static str, manual: bool, poll: impl Future<Output = ()>) {
+    let entry = GATE.lock().unwrap().enter(id, Instant::now());
+    match entry {
+        Entry::Go => {
+            let _slot = Running(id);
+            poll.await;
+        }
+        Entry::Busy => {}
+        Entry::Cooling(left) if manual => {
+            let err = ApiError::Status { code: 429, message: None, retry_after: Some(left) };
+            emit(
+                app,
+                IntegrationUpdate { id, data: json!({}), error: Some(err.describe("")), event: None },
+            );
+        }
+        Entry::Cooling(_) => {}
+    }
 }
 
 /// Set from the tray's Pause item. While it is on, nothing reaches the network:
@@ -98,21 +212,22 @@ where
             if PAUSED.load(Ordering::Relaxed) || !enabled(&app, id) {
                 continue;
             }
-            poll(app.clone()).await;
+            guarded(&app, id, false, poll(app.clone())).await;
         }
     });
 }
 
 /// One-shot refresh from the Refresh buttons in the island.
 pub async fn poll_once(app: AppHandle, id: &str) {
+    let a = app.clone();
     match id {
-        "integration_stripe" => poll_stripe(app).await,
-        "integration_github" => poll_github(app).await,
-        "integration_vercel" => poll_vercel(app).await,
-        "integration_n8n" => poll_n8n(app).await,
-        "integration_resend" => poll_resend(app).await,
-        "integration_notion" => poll_notion(app).await,
-        "integration_calcom" => poll_calcom(app).await,
+        "integration_stripe" => guarded(&app, "integration_stripe", true, poll_stripe(a)).await,
+        "integration_github" => guarded(&app, "integration_github", true, poll_github(a)).await,
+        "integration_vercel" => guarded(&app, "integration_vercel", true, poll_vercel(a)).await,
+        "integration_n8n" => guarded(&app, "integration_n8n", true, poll_n8n(a)).await,
+        "integration_resend" => guarded(&app, "integration_resend", true, poll_resend(a)).await,
+        "integration_notion" => guarded(&app, "integration_notion", true, poll_notion(a)).await,
+        "integration_calcom" => guarded(&app, "integration_calcom", true, poll_calcom(a)).await,
         _ => {}
     }
 }
@@ -133,79 +248,48 @@ fn is_new(key: &'static str, id: &str) -> bool {
     }
 }
 
-fn status_error(code: u16, unauthorised_hint: &str) -> String {
-    match code {
-        401 => "Invalid API key (401)".into(),
-        403 => unauthorised_hint.into(),
-        _ => format!("API error {code}"),
-    }
-}
-
 // ── Stripe ────────────────────────────────────────────────────────────────────
+
+const STRIPE_HINT: &str = "Use a secret key (sk_live_… not pk_live_…)";
 
 async fn poll_stripe(app: AppHandle) {
     let Some(key) = secrets::get("stripe-api-key") else { return };
-    let auth = format!("Basic {}", crate::claude::base64_for(format!("{key}:").as_bytes()));
-    let http = client();
+    let basic = || http::secret(&format!("Basic {}", crate::claude::base64_for(format!("{key}:").as_bytes())));
 
-    let balance = http
-        .get("https://api.stripe.com/v1/balance")
-        .header("Authorization", &auth)
-        .send()
-        .await;
-
-    let (amount, currency) = match balance {
-        Ok(r) if r.status().is_success() => {
-            let json: Value = r.json().await.unwrap_or(json!({}));
-            let mut buckets: Vec<Value> = Vec::new();
-            for k in ["available", "pending"] {
-                if let Some(arr) = json.get(k).and_then(Value::as_array) {
-                    buckets.extend(arr.iter().cloned());
-                }
+    let Some(json) = fetch(&app, "integration_stripe", STRIPE_HINT, |c| {
+        Ok(c.get("https://api.stripe.com/v1/balance").header(AUTHORIZATION, basic()?))
+    })
+    .await
+    else {
+        return;
+    };
+    let (amount, currency) = {
+        let mut buckets: Vec<Value> = Vec::new();
+        for k in ["available", "pending"] {
+            if let Some(arr) = json.get(k).and_then(Value::as_array) {
+                buckets.extend(arr.iter().cloned());
             }
-            let currency = buckets
-                .first()
-                .and_then(|b| b.get("currency"))
-                .and_then(Value::as_str)
-                .unwrap_or("eur")
-                .to_string();
-            let amount: i64 = buckets
-                .iter()
-                .filter_map(|b| b.get("amount").and_then(Value::as_i64))
-                .sum();
-            (amount, currency)
         }
-        Ok(r) => {
-            let code = r.status().as_u16();
-            emit(&app, IntegrationUpdate {
-                id: "integration_stripe",
-                data: json!({}),
-                error: Some(status_error(code, "Use a secret key (sk_live_… not pk_live_…)")),
-                event: None,
-            });
-            return;
-        }
-        Err(e) => {
-            emit(&app, IntegrationUpdate {
-                id: "integration_stripe",
-                data: json!({}),
-                error: Some(format!("No connection: {e}")),
-                event: None,
-            });
-            return;
-        }
+        let currency = buckets
+            .first()
+            .and_then(|b| b.get("currency"))
+            .and_then(Value::as_str)
+            .unwrap_or("eur")
+            .to_string();
+        let amount: i64 = buckets
+            .iter()
+            .filter_map(|b| b.get("amount").and_then(Value::as_i64))
+            .sum();
+        (amount, currency)
     };
 
-    let charges = http
-        .get("https://api.stripe.com/v1/charges?limit=3")
-        .header("Authorization", &auth)
-        .send()
-        .await;
-    let Ok(response) = charges else { return };
-    if !response.status().is_success() {
+    let Some(json) = fetch(&app, "integration_stripe", STRIPE_HINT, |c| {
+        Ok(c.get("https://api.stripe.com/v1/charges?limit=3").header(AUTHORIZATION, basic()?))
+    })
+    .await
+    else {
         return;
-    }
-    let json: Value = response.json().await.unwrap_or(json!({}));
+    };
     let payments: Vec<Value> = json
         .get("data")
         .and_then(Value::as_array)
@@ -266,26 +350,20 @@ async fn poll_stripe(app: AppHandle) {
 
 async fn poll_github(app: AppHandle) {
     let Some(token) = secrets::get("github-token") else { return };
-    let http = client();
+    let github = |c: &Client, url: &str| -> Result<RequestBuilder, ApiError> {
+        Ok(c.get(url)
+            .header(AUTHORIZATION, http::bearer(&token)?)
+            .header("Accept", "application/vnd.github+json")
+            .header("User-Agent", "Coucou"))
+    };
 
-    let user = http
-        .get("https://api.github.com/user")
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "Coucou")
-        .send()
-        .await;
-    let Ok(response) = user else { return };
-    if !response.status().is_success() {
-        emit(&app, IntegrationUpdate {
-            id: "integration_github",
-            data: json!({}),
-            error: Some(status_error(response.status().as_u16(), "Token lacks the needed scope")),
-            event: None,
-        });
+    let Some(json) = fetch(&app, "integration_github", "Token lacks the needed scope", |c| {
+        github(c, "https://api.github.com/user")
+    })
+    .await
+    else {
         return;
-    }
-    let json: Value = response.json().await.unwrap_or(json!({}));
+    };
     let public = json.get("public_repos").and_then(Value::as_i64).unwrap_or(0);
     let private = json
         .get("owned_private_repos")
@@ -293,26 +371,26 @@ async fn poll_github(app: AppHandle) {
         .and_then(Value::as_i64)
         .unwrap_or(0);
 
-    let repos = http
-        .get("https://api.github.com/user/repos?per_page=100&affiliation=owner&sort=pushed")
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/vnd.github+json")
-        .header("User-Agent", "Coucou")
-        .send()
-        .await;
-    let stars: i64 = match repos {
-        Ok(r) if r.status().is_success() => r
-            .json::<Value>()
-            .await
-            .ok()
-            .and_then(|v| v.as_array().cloned())
+    // The star count is a bonus on top of the user call above: if it fails the card
+    // still shows the repositories, with the reason in the log rather than a zero
+    // that looks like an answer.
+    let stars: i64 = match try_fetch(|c| {
+        github(c, "https://api.github.com/user/repos?per_page=100&affiliation=owner&sort=pushed")
+    })
+    .await
+    {
+        Ok(v) => v
+            .as_array()
             .map(|list| {
                 list.iter()
                     .filter_map(|r| r.get("stargazers_count").and_then(Value::as_i64))
                     .sum()
             })
             .unwrap_or(0),
-        _ => 0,
+        Err(err) => {
+            log::line(format!("integration_github: star count unavailable ({})", err.describe("")));
+            0
+        }
     };
 
     emit(&app, IntegrationUpdate {
@@ -327,23 +405,17 @@ async fn poll_github(app: AppHandle) {
 
 async fn poll_vercel(app: AppHandle) {
     let Some(token) = secrets::get("vercel-token") else { return };
-    let response = client()
-        .get("https://api.vercel.com/v6/deployments?limit=5")
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Accept", "application/json")
-        .send()
-        .await;
-    let Ok(response) = response else { return };
-    if !response.status().is_success() {
-        emit(&app, IntegrationUpdate {
-            id: "integration_vercel",
-            data: json!({}),
-            error: Some(status_error(response.status().as_u16(), "Token lacks access")),
-            event: None,
-        });
+    // Vercel answers an invalid token with 403, not 401 (checked live), so the
+    // 403 text has to cover both.
+    let Some(json) = fetch(&app, "integration_vercel", "Token invalid or lacks access", |c| {
+        Ok(c.get("https://api.vercel.com/v6/deployments?limit=5")
+            .header(AUTHORIZATION, http::bearer(&token)?)
+            .header("Accept", "application/json"))
+    })
+    .await
+    else {
         return;
-    }
-    let json: Value = response.json().await.unwrap_or(json!({}));
+    };
     let terminal = ["READY", "ERROR", "CANCELED"];
     let deployments: Vec<Value> = json
         .get("deployments")
@@ -399,23 +471,17 @@ async fn poll_vercel(app: AppHandle) {
 
 async fn poll_resend(app: AppHandle) {
     let Some(key) = secrets::get("resend-api-key") else { return };
-    let response = client()
-        .get("https://api.resend.com/emails?limit=100")
-        .header("Authorization", format!("Bearer {key}"))
-        .header("Accept", "application/json")
-        .send()
-        .await;
-    let Ok(response) = response else { return };
-    if !response.status().is_success() {
-        emit(&app, IntegrationUpdate {
-            id: "integration_resend",
-            data: json!({}),
-            error: Some(status_error(response.status().as_u16(), "Key lacks access")),
-            event: None,
-        });
+    // An invalid key is a 400 here ("API key is invalid", checked live); the
+    // service's message is shown with it.
+    let Some(json) = fetch(&app, "integration_resend", "Key lacks access", |c| {
+        Ok(c.get("https://api.resend.com/emails?limit=100")
+            .header(AUTHORIZATION, http::bearer(&key)?)
+            .header("Accept", "application/json"))
+    })
+    .await
+    else {
         return;
-    }
-    let json: Value = response.json().await.unwrap_or(json!({}));
+    };
     let total = json
         .get("total")
         .or_else(|| json.get("count"))
@@ -456,28 +522,19 @@ async fn poll_resend(app: AppHandle) {
 
 async fn poll_notion(app: AppHandle) {
     let Some(token) = secrets::get("notion-api-key") else { return };
-    let response = client()
-        .post("https://api.notion.com/v1/search")
-        .header("Authorization", format!("Bearer {token}"))
-        .header("Notion-Version", "2022-06-28")
-        .header("Content-Type", "application/json")
-        .json(&json!({
-            "sort": { "direction": "descending", "timestamp": "last_edited_time" },
-            "page_size": 3
-        }))
-        .send()
-        .await;
-    let Ok(response) = response else { return };
-    if !response.status().is_success() {
-        emit(&app, IntegrationUpdate {
-            id: "integration_notion",
-            data: json!({}),
-            error: Some(status_error(response.status().as_u16(), "Integration lacks access")),
-            event: None,
-        });
+    let Some(json) = fetch(&app, "integration_notion", "Integration lacks access", |c| {
+        Ok(c.post("https://api.notion.com/v1/search")
+            .header(AUTHORIZATION, http::bearer(&token)?)
+            .header("Notion-Version", "2022-06-28")
+            .json(&json!({
+                "sort": { "direction": "descending", "timestamp": "last_edited_time" },
+                "page_size": 3
+            })))
+    })
+    .await
+    else {
         return;
-    }
-    let json: Value = response.json().await.unwrap_or(json!({}));
+    };
     let pages: Vec<Value> = json
         .get("results")
         .and_then(Value::as_array)
@@ -548,23 +605,16 @@ fn parse_notion_page(obj: &Value) -> Option<Value> {
 
 async fn poll_calcom(app: AppHandle) {
     let Some(key) = secrets::get("calcom-api-key") else { return };
-    let response = client()
-        .get("https://api.cal.com/v2/bookings?status=upcoming")
-        .header("Authorization", format!("Bearer {key}"))
-        .header("cal-api-version", "2024-08-13")
-        .send()
-        .await;
-    let Ok(response) = response else { return };
-    if !response.status().is_success() {
-        emit(&app, IntegrationUpdate {
-            id: "integration_calcom",
-            data: json!({}),
-            error: Some(status_error(response.status().as_u16(), "Key lacks access")),
-            event: None,
-        });
+    // Cal.com answers an invalid key with 403, not 401 (checked live).
+    let Some(json) = fetch(&app, "integration_calcom", "Key invalid or lacks access", |c| {
+        Ok(c.get("https://api.cal.com/v2/bookings?status=upcoming")
+            .header(AUTHORIZATION, http::bearer(&key)?)
+            .header("cal-api-version", "2024-08-13"))
+    })
+    .await
+    else {
         return;
-    }
-    let json: Value = response.json().await.unwrap_or(json!({}));
+    };
     let bookings: Vec<Value> = json
         .get("data")
         .and_then(Value::as_array)
@@ -612,7 +662,11 @@ async fn poll_n8n(app: AppHandle) {
         return;
     };
     let base = raw_base.trim_end_matches('/').to_string();
-    let http = client();
+    let n8n = |c: &Client, url: &str| -> Result<RequestBuilder, ApiError> {
+        Ok(c.get(url)
+            .header("X-N8N-API-KEY", http::secret(&key)?)
+            .header("Accept", "application/json"))
+    };
 
     // Same two shapes as the Swift poller: the public API first, then /rest.
     let list_urls = [
@@ -621,28 +675,34 @@ async fn poll_n8n(app: AppHandle) {
     ];
 
     let mut items: Option<Vec<Value>> = None;
+    let mut last_error: Option<ApiError> = None;
     for url in &list_urls {
-        let Ok(response) = http.get(url).header("X-N8N-API-KEY", &key).header("Accept", "application/json").send().await
-        else {
-            continue;
-        };
-        if !response.status().is_success() {
-            // Only the status: a self-hosted base URL can carry credentials.
-            log::line(format!("n8n list HTTP {}", response.status()));
-            continue;
-        }
-        let Ok(json) = response.json::<Value>().await else { continue };
-        items = match &json {
-            Value::Object(o) => o.get("data").and_then(Value::as_array).cloned(),
-            Value::Array(a) => Some(a.clone()),
-            _ => None,
-        };
-        if items.is_some() {
-            break;
+        match try_fetch(|c| n8n(c, url)).await {
+            Ok(json) => {
+                items = match &json {
+                    Value::Object(o) => o.get("data").and_then(Value::as_array).cloned(),
+                    Value::Array(a) => Some(a.clone()),
+                    _ => None,
+                };
+                if items.is_some() {
+                    break;
+                }
+            }
+            Err(err) => {
+                // The code and kind only: a self-hosted base URL can carry credentials.
+                log::line(format!("n8n list: {}", err.describe("Access denied")));
+                last_error = Some(err);
+            }
         }
     }
 
-    let Some(first) = items.and_then(|list| list.into_iter().next()) else { return };
+    let Some(first) = items.and_then(|list| list.into_iter().next()) else {
+        // Both shapes failed: say so, instead of leaving the card as it was.
+        if let Some(err) = last_error {
+            fail(&app, "integration_n8n", &err, "API key lacks access");
+        }
+        return;
+    };
     let id = match first.get("id") {
         Some(Value::String(s)) => s.clone(),
         Some(Value::Number(n)) => n.to_string(),
@@ -667,14 +727,10 @@ async fn poll_n8n(app: AppHandle) {
     let mut name = "Workflow".to_string();
     let mut detail = None;
     for url in &detail_urls {
-        let Ok(response) = http.get(url).header("X-N8N-API-KEY", &key).header("Accept", "application/json").send().await
-        else {
-            continue;
-        };
-        if !response.status().is_success() {
-            continue;
-        }
-        let Ok(json) = response.json::<Value>().await else { continue };
+        // A failure here only costs the detail: the next shape is tried, and the
+        // event still fires with the generic name. (A response too large to hold,
+        // which includeData=true can produce, falls through to the lighter URL.)
+        let Ok(json) = try_fetch(|c| n8n(c, url)).await else { continue };
         name = json
             .get("workflowData")
             .and_then(|w| w.get("name"))
@@ -763,3 +819,74 @@ fn fmt_value(v: &Value) -> String {
         other => other.to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_poll_per_integration_at_a_time() {
+        let mut gate = Gate::default();
+        let now = Instant::now();
+        assert_eq!(gate.enter("integration_stripe", now), Entry::Go);
+        // A Refresh pressed while a poll is running does not start a second one.
+        assert_eq!(gate.enter("integration_stripe", now), Entry::Busy);
+        assert_eq!(gate.enter("integration_stripe", now), Entry::Busy);
+        // Another integration is independent.
+        assert_eq!(gate.enter("integration_github", now), Entry::Go);
+        gate.leave("integration_stripe");
+        assert_eq!(gate.enter("integration_stripe", now), Entry::Go);
+    }
+
+    #[test]
+    fn a_rate_limited_integration_is_left_alone_for_the_time_it_was_told() {
+        let mut gate = Gate::default();
+        let t0 = Instant::now();
+        gate.cool_down("integration_vercel", Some(Duration::from_secs(90)), t0);
+        assert_eq!(gate.enter("integration_vercel", t0 + Duration::from_secs(30)), Entry::Cooling(Duration::from_secs(60)));
+        // Others are unaffected, and once the time has passed it polls again.
+        assert_eq!(gate.enter("integration_github", t0), Entry::Go);
+        assert_eq!(gate.enter("integration_vercel", t0 + Duration::from_secs(91)), Entry::Go);
+    }
+
+    #[test]
+    fn the_cooldown_has_a_default_and_a_ceiling() {
+        let mut gate = Gate::default();
+        let t0 = Instant::now();
+        gate.cool_down("a", None, t0);
+        assert_eq!(gate.enter("a", t0), Entry::Cooling(DEFAULT_COOLDOWN));
+        // A service cannot park an integration for hours.
+        gate.cool_down("b", Some(Duration::from_secs(86_400)), t0);
+        assert_eq!(gate.enter("b", t0), Entry::Cooling(MAX_COOLDOWN));
+    }
+
+    #[test]
+    fn failures_are_worded_for_the_island_and_never_contain_a_key() {
+        let key = "sk_live_SECRETKEY";
+        let cases = [
+            (ApiError::Status { code: 401, message: Some(format!("Invalid API Key provided: {key}")), retry_after: None }, "Invalid API key (401)"),
+            (ApiError::Status { code: 429, message: None, retry_after: Some(Duration::from_secs(30)) }, "Rate limited (429) — try again in 30 s"),
+            (ApiError::Status { code: 502, message: None, retry_after: None }, "Service unavailable (502)"),
+            (ApiError::Timeout, "Timed out"),
+            (ApiError::Connect, "No connection"),
+            (ApiError::Malformed, "Unexpected response"),
+            (ApiError::TooLarge, "Response too large"),
+        ];
+        for (err, expected) in cases {
+            let shown = err.describe(STRIPE_HINT);
+            assert_eq!(shown, expected);
+            assert!(!shown.contains(key));
+        }
+    }
+
+    /// An n8n URL that is not a URL is reported as such, not as "no connection".
+    #[test]
+    fn a_malformed_n8n_url_is_a_clear_error() {
+        crate::http::tests::run(async {
+            let err = try_fetch(|c| Ok(c.get("not a url at all"))).await.unwrap_err();
+            assert_eq!(err.describe(""), "Request rejected (400) — invalid URL");
+            assert!(!err.is_transient());
+        });
+    }
+}
+
