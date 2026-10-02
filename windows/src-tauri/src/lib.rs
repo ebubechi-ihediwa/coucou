@@ -63,6 +63,8 @@ fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
 
 #[tauri::command]
 fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
+    // Whatever the page sent is held to the same rules as a settings file.
+    let settings = settings::sanitized(settings);
     let (screen_changed, autostart_changed) = {
         let mut current = shared.settings.lock().unwrap();
         let screen_changed = current.screen != settings.screen;
@@ -70,9 +72,8 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
         *current = settings.clone();
         (screen_changed, autostart_changed)
     };
-    if let Err(err) = settings::save(&settings) {
-        eprintln!("[coucou] could not save settings: {err}");
-    }
+    // The log, not stderr: there is no console to read it from.
+    settings::save_or_log(&settings);
     if autostart_changed {
         let manager = app.autolaunch();
         let result = if settings.autostart { manager.enable() } else { manager.disable() };
@@ -206,7 +207,7 @@ fn hooks_apply(
     let updated = {
         let mut current = shared.settings.lock().unwrap();
         current.hooks_installed = install;
-        let _ = settings::save(&current);
+        settings::save_or_log(&current);
         current.clone()
     };
     let _ = app.emit("settings-changed", updated);
