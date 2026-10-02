@@ -119,6 +119,35 @@ The build comes first because the app's Rust build needs both `dist/` and
 `target/release/coucou-hook.exe`, and `npm run build` makes them. The workflow
 tests and builds only; it never packages, signs or publishes.
 
+### Verifying the API integrations
+
+Every outbound request (the chat and the Stripe, GitHub, Vercel, Resend, Notion,
+Cal.com and n8n pollers) goes through `src-tauri/src/http.rs`. Its behaviour —
+error kinds, size limits, retries, timeouts, cancellation, redirects — is tested
+against a local server, so `cargo test --workspace` never touches the network.
+
+Two checks talk to the real services. They are `#[ignore]`d, cost nothing, and
+print only a status and a count, never a key or a response body:
+
+```powershell
+cargo test -p coucou --lib live_ -- --ignored --nocapture --test-threads=1
+```
+
+- `live_every_endpoint_rejects_a_fake_key_the_way_the_code_expects` sends an
+  obviously fake key to each endpoint and checks the answer is the rejection the
+  code expects (no account needed).
+- `live_anthropic_models_with_the_stored_key` uses the Anthropic key saved in the
+  Credential Manager (or the Secret Service on Linux) to call the free
+  `/v1/models` endpoint and reports whether the models Coucou offers are listed.
+  It does nothing if no key is stored.
+
+To check a poller by hand, save its key in Settings, open the island, press
+Refresh on that pill, and read `%LOCALAPPDATA%\Coucou\coucou.log`: each failure is
+one line naming the integration and the kind of failure. A wrong key shows
+"Invalid API key (401)" (Vercel and Cal.com answer 403 and Resend 400 for an
+invalid key; the service's own short explanation is shown with it). Turning the
+network off shows "No connection", and the next poll recovers by itself.
+
 The 28 sounds are the macOS app's own files; they are never duplicated in this
 folder. The path is declared once, in `SOUNDS_DIR` at the top of
 `vite.config.ts` — when they move to `shared/sounds/`, change that one line.

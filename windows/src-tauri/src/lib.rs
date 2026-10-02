@@ -3,6 +3,7 @@
 mod claude;
 mod files;
 mod hooks;
+mod http;
 mod integrations;
 mod island;
 mod log;
