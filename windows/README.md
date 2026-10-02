@@ -107,6 +107,18 @@ Installing is optional — `target/release/coucou.exe` runs on its own. There is
 window in the taskbar and no console: the island at the top of the screen and the
 Mochi in the notification area are the whole app, and Quit lives in its menu.
 
+Pull requests into `main` and pushes to `main` run the same checks in CI
+(`.github/workflows/windows-ci.yml`), on Windows:
+
+```powershell
+npm run build          # type-checks, bundles dist/, builds coucou-hook.exe
+cargo test --workspace
+```
+
+The build comes first because the app's Rust build needs both `dist/` and
+`target/release/coucou-hook.exe`, and `npm run build` makes them. The workflow
+tests and builds only; it never packages, signs or publishes.
+
 The 28 sounds are the macOS app's own files; they are never duplicated in this
 folder. The path is declared once, in `SOUNDS_DIR` at the top of
 `vite.config.ts` — when they move to `shared/sounds/`, change that one line.

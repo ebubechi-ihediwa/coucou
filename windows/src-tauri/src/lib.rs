@@ -7,6 +7,8 @@ mod integrations;
 mod island;
 mod log;
 mod pipe;
+#[cfg(windows)]
+mod pipe_acl;
 mod platform;
 mod secrets;
 mod settings;

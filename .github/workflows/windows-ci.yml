@@ -1,0 +1,81 @@
+name: Windows CI
+
+# Checks that the Windows app still builds and its tests pass, on every pull
+# request into main and every push to main. Validation only: nothing is packaged,
+# uploaded, signed or published here. The installer and its release steps stay in
+# windows.yml, which runs on `windows-v*` tags.
+#
+# Deliberately no `paths:` filter. `windows/` builds its sounds from
+# NotchBuddy/Resources/sounds, so a Swift-side change can break this build too,
+# and a filtered workflow that is skipped can never be made a required check.
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+# Read-only, and the token is not even kept on disk (persist-credentials below).
+permissions:
+  contents: read
+
+# A new push to a pull request makes the previous run pointless.
+concurrency:
+  group: windows-ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: windows
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: windows/package-lock.json
+
+      # The project pins no toolchain (no rust-toolchain file), so this is the
+      # stable one for the runner's default MSVC target, which is the target the
+      # app ships for. rustup is already on the image; no third-party action.
+      - name: Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustc --version
+          cargo --version
+
+      # A separate key from windows.yml: that one caches a release build.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            windows/target
+          key: windows-ci-cargo-${{ hashFiles('windows/Cargo.lock') }}
+          restore-keys: windows-ci-cargo-
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Runs before the tests on purpose, not as an afterthought. `npm run build`
+      # type-checks, bundles the frontend into dist/ and (its `prebuild` step)
+      # builds target/release/coucou-hook.exe. The app's build script refuses to
+      # compile without that binary, and Tauri embeds dist/, so `cargo test`
+      # cannot even start until both exist.
+      - name: Build the frontend
+        run: npm run build
+
+      - name: Test the Rust workspace
+        run: cargo test --workspace
