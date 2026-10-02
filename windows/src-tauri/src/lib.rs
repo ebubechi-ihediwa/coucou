@@ -252,10 +252,11 @@ fn chat_reset(chat: State<Chat>) {
     chat.reset();
 }
 
-/// Copies a dropped file into the inbox and reports its name back.
+/// Copies a dropped file into the inbox and reports its name back. Only a path the
+/// OS handed us in a drop is accepted (see `files::Grants`).
 #[tauri::command]
-fn ingest_file(path: String) -> Result<DroppedFile, String> {
-    files::ingest(&path)
+fn ingest_file(grants: State<files::Grants>, path: String) -> Result<DroppedFile, String> {
+    files::ingest(&grants, &path)
 }
 
 /// The island may only ask whether a key exists — never read it.
@@ -376,6 +377,17 @@ pub fn run() {
         })
         .manage(Pending::default())
         .manage(Chat::default())
+        .manage(files::Grants::default())
+        // The OS drop event is the only source of a path `ingest_file` will accept.
+        // It is recorded here, in Rust, before the page is able to react to it.
+        .on_webview_event(|webview, event| {
+            if webview.label() != island::WINDOW_LABEL {
+                return;
+            }
+            if let tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+                webview.state::<files::Grants>().grant(paths);
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             boot,
             save_settings,

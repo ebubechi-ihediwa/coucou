@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::secrets;
+use crate::{files, log, secrets};
 
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -86,7 +86,8 @@ pub async fn send(
     if chat.is_empty() {
         match &context {
             Some(ChatContext::File { name, path }) => {
-                if let Some(block) = file_block(path) {
+                // An Err returns before anything is pushed: the history stays as it was.
+                if let Some(block) = file_block(path)? {
                     content.push(block);
                 }
                 content.push(json!({ "type": "text", "text": format!("File: {name}") }));
@@ -194,7 +195,28 @@ async fn call(key: &str, body: &Value) -> Result<Value, String> {
 
 /// PDF → document block, image → image block, text/code → inline text.
 /// Mirrors readFileAsBlock() in ClaudeService.swift.
-fn file_block(path: &str) -> Option<Value> {
+///
+/// `path` comes from the page, so it is only ever read through `files`, which
+/// serves nothing from outside the inbox and nothing above a size limit. What the
+/// user must hear about is an `Err`; a file that is simply gone, unreadable or too
+/// long to inline is left out, as before, and the question is still asked.
+fn file_block(path: &str) -> Result<Option<Value>, String> {
+    file_block_in(path, &files::inbox_dir())
+}
+
+fn file_block_in(path: &str, inbox: &std::path::Path) -> Result<Option<Value>, String> {
+    use files::ReadError;
+
+    let read = |limit| files::read_confined(inbox, std::path::Path::new(path), limit);
+    let skipped = |why: ReadError| match why {
+        ReadError::Outside | ReadError::TooLarge(_) => Err(why.message()),
+        // No path in the log: it came from the page.
+        _ => {
+            log::line(format!("chat file skipped: {why:?}"));
+            Ok(None)
+        }
+    };
+
     let ext = std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
@@ -211,19 +233,24 @@ fn file_block(path: &str) -> Option<Value> {
     };
 
     if let Some((block_type, media)) = media_type {
-        let bytes = std::fs::read(path).ok()?;
-        return Some(json!({
+        let bytes = match read(files::MAX_ATTACHMENT) {
+            Ok(bytes) => bytes,
+            Err(why) => return skipped(why),
+        };
+        return Ok(Some(json!({
             "type": block_type,
             "source": { "type": "base64", "media_type": media, "data": base64(&bytes) },
-        }));
+        })));
     }
 
-    let len = std::fs::metadata(path).ok()?.len();
-    if len > MAX_INLINE_TEXT {
-        return None;
-    }
-    let text = std::fs::read_to_string(path).ok()?;
-    Some(json!({ "type": "text", "text": format!("File contents:\n{text}") }))
+    // Too long to inline is skipped quietly (as on macOS), not an error.
+    let bytes = match read(MAX_INLINE_TEXT) {
+        Ok(bytes) => bytes,
+        Err(files::ReadError::TooLarge(_)) => return Ok(None),
+        Err(why) => return skipped(why),
+    };
+    let Ok(text) = String::from_utf8(bytes) else { return Ok(None) };
+    Ok(Some(json!({ "type": "text", "text": format!("File contents:\n{text}") })))
 }
 
 /// Small standalone base64 encoder — not worth another dependency.
@@ -248,7 +275,91 @@ fn base64(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::base64;
+    use super::{base64, file_block_in, files, MAX_INLINE_TEXT};
+    use std::path::{Path, PathBuf};
+
+    /// An inbox stand-in and an outside folder, under the temp dir, removed on drop.
+    struct Dirs(PathBuf);
+
+    impl Dirs {
+        fn new() -> Dirs {
+            // One folder per test: they run in parallel.
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let root = std::env::temp_dir().join(format!("coucou-claude-test-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(root.join("inbox")).unwrap();
+            std::fs::create_dir_all(root.join("outside")).unwrap();
+            Dirs(root)
+        }
+        fn inbox(&self) -> PathBuf {
+            self.0.join("inbox")
+        }
+        fn block(&self, path: &Path) -> Result<Option<serde_json::Value>, String> {
+            file_block_in(path.to_str().unwrap(), &self.inbox())
+        }
+    }
+
+    impl Drop for Dirs {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn the_chat_attaches_text_pdf_and_images_from_the_inbox() {
+        let d = Dirs::new();
+        std::fs::write(d.inbox().join("a.txt"), "hello").unwrap();
+        std::fs::write(d.inbox().join("a.pdf"), b"%PDF-1.4").unwrap();
+        std::fs::write(d.inbox().join("a.PNG"), [0x89, b'P', b'N', b'G']).unwrap();
+        // No extension: text, as before (inside the inbox that is harmless).
+        std::fs::write(d.inbox().join("README"), "plain").unwrap();
+
+        let text = d.block(&d.inbox().join("a.txt")).unwrap().unwrap();
+        assert_eq!(text["text"], "File contents:\nhello");
+        let pdf = d.block(&d.inbox().join("a.pdf")).unwrap().unwrap();
+        assert_eq!((pdf["type"].as_str(), pdf["source"]["media_type"].as_str()), (Some("document"), Some("application/pdf")));
+        assert_eq!(pdf["source"]["data"], base64(b"%PDF-1.4"));
+        let png = d.block(&d.inbox().join("a.PNG")).unwrap().unwrap();
+        assert_eq!(png["source"]["media_type"], "image/png");
+        assert_eq!(d.block(&d.inbox().join("README")).unwrap().unwrap()["text"], "File contents:\nplain");
+    }
+
+    #[test]
+    fn a_path_outside_the_inbox_is_refused_whatever_it_looks_like() {
+        let d = Dirs::new();
+        let secret = d.0.join("outside").join("id_rsa");
+        std::fs::write(&secret, "PRIVATE KEY").unwrap();
+        // An extensionless "text" file elsewhere is exactly what used to be read.
+        let err = d.block(&secret).unwrap_err();
+        assert!(err.contains("inbox"), "{err}");
+        assert!(!err.contains("id_rsa"), "the message must not echo the path");
+        for sneaky in [
+            d.inbox().join("..").join("outside").join("id_rsa"),
+            PathBuf::from("id_rsa"),
+            d.0.join("outside").join("id_rsa.png"),
+            d.0.join("outside").join("id_rsa.pdf"),
+        ] {
+            assert!(d.block(&sneaky).is_err(), "{sneaky:?}");
+        }
+    }
+
+    #[test]
+    fn oversized_and_unusable_files_behave_as_documented() {
+        let d = Dirs::new();
+        // Text over the inline limit is left out quietly, as on macOS.
+        std::fs::write(d.inbox().join("big.txt"), vec![b'a'; MAX_INLINE_TEXT as usize + 1]).unwrap();
+        assert_eq!(d.block(&d.inbox().join("big.txt")).unwrap(), None);
+        // Not UTF-8 and not a known type: left out, not an error.
+        std::fs::write(d.inbox().join("blob.bin"), [0xFF, 0xFE, 0x00]).unwrap();
+        assert_eq!(d.block(&d.inbox().join("blob.bin")).unwrap(), None);
+        // A file that vanished is left out too.
+        assert_eq!(d.block(&d.inbox().join("gone.txt")).unwrap(), None);
+        // A PDF or image beyond the limit is an error the user can read.
+        let huge = d.inbox().join("huge.pdf");
+        std::fs::File::create(&huge).unwrap().set_len(files::MAX_ATTACHMENT + 1).unwrap();
+        let err = d.block(&huge).unwrap_err();
+        assert!(err.contains("too large") && err.contains("20 MB"), "{err}");
+    }
 
     #[test]
     fn base64_matches_rfc4648_vectors() {
