@@ -25,3 +25,7 @@ windows = { version = "0.61", features = [
 # The socket syscalls and peer credentials the Linux transport needs.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
+
+# The tests stand up a real pipe server.
+[target.'cfg(windows)'.dev-dependencies]
+windows = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
