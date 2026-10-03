@@ -1025,7 +1025,54 @@ mod tests {
         });
     }
 
+    /// What SDDL writes for a descriptor made from `sddl`. Windows prints some
+    /// accounts by alias instead of by SID (`LA` for the local Administrator, `BA`
+    /// for the Administrators group, …), so a DACL read back from a pipe cannot be
+    /// compared with a SID string; it has to be compared with this.
+    #[cfg(windows)]
+    fn canonical_sddl(sddl: &str) -> String {
+        use windows::core::{PCWSTR, PWSTR};
+        use windows::Win32::Foundation::{HLOCAL, LocalFree};
+        use windows::Win32::Security::Authorization::{
+            ConvertSecurityDescriptorToStringSecurityDescriptorW,
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows::Win32::Security::{DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+
+        let wide: Vec<u16> = format!("{sddl}\0").encode_utf16().collect();
+        // SAFETY: `wide` is NUL-terminated and outlives the call; the descriptor and
+        // the string are LocalFree'd exactly once.
+        unsafe {
+            let mut descriptor = PSECURITY_DESCRIPTOR::default();
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                PCWSTR(wide.as_ptr()),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                None,
+            )
+            .unwrap();
+            let mut text = PWSTR::null();
+            ConvertSecurityDescriptorToStringSecurityDescriptorW(
+                descriptor,
+                SDDL_REVISION_1,
+                DACL_SECURITY_INFORMATION,
+                &mut text,
+                None,
+            )
+            .unwrap();
+            let out = text.to_string().unwrap();
+            let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+            let _ = LocalFree(Some(HLOCAL(descriptor.0)));
+            out
+        }
+    }
+
     /// First and later instances carry the same single-ACE DACL naming only us.
+    ///
+    /// The expectation is built from our SID in the same canonical form the pipe's
+    /// DACL is read back in. Searching for the SID string instead failed on GitHub's
+    /// Windows runner, whose user is the built-in Administrator (RID 500): SDDL
+    /// prints that account as `LA`, so the long SID is nowhere in the text.
     #[cfg(windows)]
     #[test]
     fn every_instance_admits_only_our_sid() {
@@ -1033,12 +1080,27 @@ mod tests {
             let pipe = RelayPipe::new(unique_name("dacl"), &my_sid()).unwrap();
             let first = pipe.create_first().unwrap();
             let later = pipe.create().unwrap();
+            // Protected, one allow entry, full file access, to this SID and no one else.
+            let expected = canonical_sddl(&format!("D:P(A;;FA;;;{})", my_sid()));
             for (which, instance) in [("first", &first), ("later", &later)] {
-                let sddl = dacl_of(instance);
-                assert!(sddl.starts_with("D:P"), "{which}: DACL is not protected: {sddl}");
-                assert!(sddl.contains(&my_sid()), "{which}: {sddl}");
-                assert_eq!(sddl.matches('(').count(), 1, "{which}: more than one entry: {sddl}");
+                assert_eq!(dacl_of(instance), expected, "{which} instance");
             }
+        });
+    }
+
+    /// The mechanism behind that CI failure, reproduced with an account that is
+    /// printed by alias on every machine: the Administrators group.
+    #[cfg(windows)]
+    #[test]
+    fn a_dacl_names_well_known_accounts_by_alias_so_it_is_compared_canonically() {
+        run(async {
+            let administrators = "S-1-5-32-544";
+            let pipe = RelayPipe::new(unique_name("alias"), administrators).unwrap();
+            let instance = pipe.create_first().unwrap();
+            let sddl = dacl_of(&instance);
+            assert!(!sddl.contains(administrators), "printed by alias, not by SID: {sddl}");
+            assert!(sddl.contains(";;;BA)"), "{sddl}");
+            assert_eq!(sddl, canonical_sddl(&format!("D:P(A;;FA;;;{administrators})")));
         });
     }
 
