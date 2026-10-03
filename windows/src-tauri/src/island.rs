@@ -309,3 +309,60 @@ pub fn set_ignore_cursor(app: &AppHandle, ignore: bool) {
         let _ = win.set_ignore_cursor_events(ignore);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Guards for "the hidden island costs nothing". They read the page's sources, so
+    //! they run everywhere `cargo test` does; the real check, against the running
+    //! app, is `scripts/check-idle-render.ps1`.
+
+    fn read(relative: &str) -> String {
+        std::fs::read_to_string(format!("{}/../{relative}", env!("CARGO_MANIFEST_DIR")))
+            .unwrap_or_else(|e| panic!("{relative}: {e}"))
+    }
+
+    /// An endless CSS animation is main-thread work that keeps the page rendering at
+    /// 60 Hz even with the island hidden (measured: ~4 % of a core from the drop
+    /// frame's marching dashes alone). They are paused unless they sit in the active
+    /// view of an open island, which needs the rule below and the `shown` class.
+    #[test]
+    fn endless_animations_are_paused_unless_the_island_is_open() {
+        let css = read("src/style.css");
+        let rule = css
+            .split('}')
+            .find(|block| block.contains("animation-play-state: paused !important"))
+            .expect("the rule that pauses endless animations is gone from style.css");
+        let selector = rule.split('{').next().unwrap();
+        assert!(selector.contains(".view:not(.on) *"), "inactive views must be paused: {selector}");
+        assert!(selector.contains("#content:not(.shown) *"), "a closed island must be paused: {selector}");
+
+        let ts = read("src/island/island.ts");
+        assert!(
+            ts.contains(r#"this.contentEl.classList.toggle("shown", expanded && !greetingActive)"#),
+            "Island.syncDom no longer sets #content.shown, so the pause rule would never lift"
+        );
+    }
+
+    /// The pause rule only reaches elements inside #content. A new endless animation
+    /// elsewhere (the wake strip, the island body, the header outside #content)
+    /// would run all the time, so adding one means placing it inside a view and
+    /// adding its selector here on purpose.
+    #[test]
+    fn every_endless_animation_lives_in_a_view() {
+        let css = read("src/style.css");
+        let known = [".shimmer", ".typing i", ".drop-frame rect", ".drop-card.over .drop-frame rect", ".pulse"];
+        for block in css.split('}') {
+            let Some((selector, body)) = block.split_once('{') else { continue };
+            if !(body.contains("animation:") && body.contains("infinite")) {
+                continue;
+            }
+            // Drop comments that precede the selector.
+            let selector = selector.rsplit("*/").next().unwrap().trim();
+            assert!(
+                known.iter().any(|k| selector.ends_with(k)),
+                "`{selector}` has an endless animation that is not known to live inside a view; \
+                 put it in one (so it is paused while the island is hidden) and list it here"
+            );
+        }
+    }
+}

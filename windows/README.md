@@ -158,6 +158,14 @@ The app icon and the tray icon are drawn in code, like Mochi itself:
 npm run icons          # regenerates src-tauri/icons from scripts/gen-icons.mjs
 ```
 
+### Idle resource use
+
+The island must cost nothing while hidden. [PERFORMANCE.md](PERFORMANCE.md) lists what
+runs in the background, how idle CPU, memory and wakeups are measured
+(`scripts/measure-idle.ps1`) and the results. `scripts/check-idle-render.ps1` is the
+quick pass/fail check that the hidden island's page is quiet; `cargo test` has the
+matching guards in `island::tests`.
+
 ### Layout
 
 ```
