@@ -271,6 +271,18 @@ body {
   transition: opacity 0.3s ease-out 0.16s, transform 0.3s cubic-bezier(0.3, 1.2, 0.4, 1) 0.16s;
 }
 
+/* The views' endless animations (the drop frame's marching dashes, the ticker
+   shimmer, the typing dots, the pulse) run on the main thread, and a running one
+   keeps the page rendering at 60 Hz whether or not anything can be seen. Measured:
+   with the island hidden, the drop frame alone cost about 4 % of a core. They only
+   matter in the active view while the island is open (#content.shown, set in
+   Island.syncDom); everywhere else they are paused, not removed, so they pick up
+   where they left off. */
+.view:not(.on) *,
+#content:not(.shown) * {
+  animation-play-state: paused !important;
+}
+
 /* ── Cards ──────────────────────────────────────────────────────────────── */
 
 .card {

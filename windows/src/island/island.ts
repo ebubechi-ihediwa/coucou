@@ -841,6 +841,9 @@ export class Island {
 
     this.contentEl.style.opacity = expanded && !greetingActive ? "1" : "0";
     this.contentEl.style.pointerEvents = expanded && !greetingActive ? "auto" : "none";
+    // The same condition, as a class the stylesheet can use to pause the views'
+    // endless animations while nothing can be seen of them.
+    this.contentEl.classList.toggle("shown", expanded && !greetingActive);
     this.greetingCanvas.style.display = greetingActive ? "block" : "none";
 
     this.header.sync();
