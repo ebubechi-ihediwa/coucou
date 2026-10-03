@@ -76,9 +76,26 @@ pub fn no_console(cmd: &mut Command) -> &mut Command {
     cmd.creation_flags(CREATE_NO_WINDOW)
 }
 
+/// Hands a link to the default handler and says whether that could be started.
+/// The handler opens anything it is given (a path, another protocol), so callers
+/// check what they pass; see `actions::SafeUrl`.
+pub fn try_open_url(url: &str) -> std::io::Result<()> {
+    no_console(Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", url]))
+        .spawn()
+        .map(|_| ())
+}
+
 pub fn open_url(url: &str) {
-    let _ = no_console(Command::new("rundll32.exe").args(["url.dll,FileProtocolHandler", url]))
-        .spawn();
+    let _ = try_open_url(url);
+}
+
+/// Opens a file with the program Windows has chosen for its type. That program
+/// runs if the file is one (an `.exe`, a `.bat`): callers must only pass files whose
+/// type they have vetted; see `executor::OPENABLE_EXTENSIONS`.
+pub fn try_open_path(path: &std::path::Path) -> std::io::Result<()> {
+    no_console(Command::new("rundll32.exe").arg("url.dll,FileProtocolHandler").arg(path))
+        .spawn()
+        .map(|_| ())
 }
 
 pub fn reveal_folder(path: &str) {

@@ -250,17 +250,7 @@ impl ReadError {
 /// 3. The size is read from that same handle, then the read itself is capped, so
 ///    a file that grows after the check still cannot exceed `max`.
 pub(crate) fn read_confined(root: &Path, path: &Path, max: u64) -> Result<Vec<u8>, ReadError> {
-    if !named_inside(root, path) {
-        return Err(ReadError::Outside);
-    }
-    let real_root = std::fs::canonicalize(root).map_err(|e| read_error(&e))?;
-    let file = open_for_read(path).map_err(|e| read_error(&e))?;
-    match opened_path(&file) {
-        Ok(real) if real != real_root && real.starts_with(&real_root) => {}
-        Ok(_) => return Err(ReadError::Outside),
-        // Cannot say where the handle lives: not a reason to trust it.
-        Err(_) => return Err(ReadError::Unreadable),
-    }
+    let (file, _) = open_confined(root, path)?;
     let meta = file.metadata().map_err(|e| read_error(&e))?;
     if !meta.is_file() {
         return Err(ReadError::NotAFile);
@@ -269,6 +259,34 @@ pub(crate) fn read_confined(root: &Path, path: &Path, max: u64) -> Result<Vec<u8
         return Err(ReadError::TooLarge(max));
     }
     read_capped(file, max)
+}
+
+/// Steps 1 and 2 above, shared with everything else that must act only on a file
+/// in the inbox: the open file and where the OS says it really is.
+fn open_confined(root: &Path, path: &Path) -> Result<(File, PathBuf), ReadError> {
+    if !named_inside(root, path) {
+        return Err(ReadError::Outside);
+    }
+    let real_root = std::fs::canonicalize(root).map_err(|e| read_error(&e))?;
+    let file = open_for_read(path).map_err(|e| read_error(&e))?;
+    match opened_path(&file) {
+        Ok(real) if real != real_root && real.starts_with(&real_root) => Ok((file, real)),
+        Ok(_) => Err(ReadError::Outside),
+        // Cannot say where the handle lives: not a reason to trust it.
+        Err(_) => Err(ReadError::Unreadable),
+    }
+}
+
+/// The real location of a regular file inside `root`, after the same checks a read
+/// gets (name, open file, resolved location). For actions that hand a file to the
+/// system rather than read it: they must be given *this* path, not the one asked
+/// for, so a link swapped in afterwards changes nothing about what was checked.
+pub(crate) fn confine_existing(root: &Path, path: &Path) -> Result<PathBuf, ReadError> {
+    let (file, real) = open_confined(root, path)?;
+    if !file.metadata().map_err(|e| read_error(&e))?.is_file() {
+        return Err(ReadError::NotAFile);
+    }
+    Ok(real)
 }
 
 fn read_error(err: &io::Error) -> ReadError {

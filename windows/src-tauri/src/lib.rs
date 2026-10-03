@@ -1,6 +1,9 @@
 // Coucou for Windows — app wiring and the commands the island calls.
 
+mod actions;
+mod assistant;
 mod claude;
+mod executor;
 mod files;
 mod hooks;
 mod http;
@@ -23,7 +26,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
 use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
 
-use claude::{Chat, ChatContext, ChatReply};
+use claude::{Chat, ChatContext};
 use files::DroppedFile;
 use hooks::{HookPreview, HookStatus};
 use island::{PollGate, ScreenInfo};
@@ -237,21 +240,163 @@ fn approval_decline(app: AppHandle, request_id: String) {
 
 // ── Chat, files and secrets ───────────────────────────────────────────────────
 
+/// The assistant runtime, with the real launcher.
+type Assistant = assistant::Runtime<executor::SystemLauncher>;
+
+/// What a chat turn gives the island: the words, and an action waiting for an answer.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChatReply {
+    text: String,
+    proposal: Option<assistant::ProposalView>,
+    /// The person cancelled; there is nothing to show.
+    cancelled: bool,
+}
+
+/// Tells the island where the assistant stands, so a card can appear whatever
+/// view is open.
+fn publish(app: &AppHandle, snapshot: &assistant::Snapshot) {
+    let _ = app.emit_to(island::WINDOW_LABEL, "assistant", snapshot);
+}
+
 /// One chat turn. The API key and any file bytes stay on the Rust side.
+///
+/// The model may answer with an action to propose. It is judged here, in Rust, and
+/// comes back as a proposal for the person to approve: nothing runs from this call
+/// unless the policy has explicitly let a low-risk action through.
 #[tauri::command]
 async fn chat_send(
+    app: AppHandle,
     shared: State<'_, Shared>,
     chat: State<'_, Chat>,
+    assistant: State<'_, Assistant>,
     query: String,
     context: Option<ChatContext>,
 ) -> Result<ChatReply, String> {
     let model = shared.settings.lock().unwrap().model.clone();
-    claude::send(&chat, &model, query, context).await
+    let (token, superseded) = assistant
+        .begin_turn()
+        .map_err(|_| "Coucou is still working on your last request.".to_string())?;
+    assistant::settle(&chat, superseded);
+    publish(&app, &assistant.snapshot());
+
+    // The request runs as a task of its own so that cancelling can end it. If it
+    // is ended, its sender goes with it and the wait below returns an error.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let task_app = app.clone();
+    let task = tauri::async_runtime::spawn(async move {
+        let chat = task_app.state::<Chat>();
+        let assistant = task_app.state::<Assistant>();
+        let reply = claude::send(&chat, &model, query, context, assistant.files()).await;
+        let _ = tx.send(reply);
+    });
+    assistant.attach_abort(token, move || task.abort());
+
+    let cancelled = || ChatReply { text: String::new(), proposal: None, cancelled: true };
+    let Ok(reply) = rx.await else { return Ok(cancelled()) };
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(message) => {
+            assistant.fail_turn(token, message.clone());
+            publish(&app, &assistant.snapshot());
+            return Err(message);
+        }
+    };
+
+    let Ok(settled) = assistant.on_reply(token, reply.text, reply.proposal) else {
+        // Cancelled while the answer was on its way: it is dropped, not shown.
+        return Ok(cancelled());
+    };
+    let (text, proposal) = match settled {
+        assistant::Settled::Reply { text } => (text, None),
+        assistant::Settled::Proposed { text, proposal } => (text, Some(proposal)),
+        assistant::Settled::Refused { text, reason, result } => {
+            assistant::settle(&chat, Some(result));
+            log::line(format!("assistant: refused a proposed action ({reason})"));
+            // The model's words may promise something; say that nothing happened.
+            let said = if text.is_empty() {
+                reason
+            } else {
+                format!("{text}\n\nCoucou didn't do that: {reason}")
+            };
+            (said, None)
+        }
+        assistant::Settled::AutoApproved { text, proposal, approved } => {
+            // Only a policy that allows low-risk actions without asking gets here.
+            let outcome = run_approved(&assistant, &approved);
+            let (snapshot, result) = assistant.finish(proposal.id, outcome);
+            assistant::settle(&chat, result);
+            publish(&app, &snapshot);
+            return Ok(ChatReply { text, proposal: None, cancelled: false });
+        }
+    };
+    publish(&app, &assistant.snapshot());
+    Ok(ChatReply { text, proposal, cancelled: false })
+}
+
+/// Carries out an approved action and logs how it ended, never what it targeted.
+/// The executor only starts a process or checks one file, which takes milliseconds,
+/// so it runs right here rather than on a thread of its own.
+fn run_approved(assistant: &Assistant, approved: &assistant::Approved) -> executor::Outcome {
+    let outcome = assistant.execute(approved);
+    log::line(format!(
+        "assistant: action {} {}",
+        approved.id,
+        match &outcome {
+            executor::Outcome::Done(_) => "done",
+            executor::Outcome::Failed(_) => "failed",
+            executor::Outcome::Cancelled => "cancelled before it started",
+        }
+    ));
+    outcome
+}
+
+/// The person's answer to a proposal. Approving runs the action; denying withdraws
+/// it. Either way the result is returned and published.
+#[tauri::command]
+async fn assistant_decide(
+    app: AppHandle,
+    chat: State<'_, Chat>,
+    assistant: State<'_, Assistant>,
+    proposal_id: u64,
+    approve: bool,
+) -> Result<assistant::Snapshot, String> {
+    if !approve {
+        let result = assistant.deny(proposal_id).map_err(|e| e.message().to_string())?;
+        assistant::settle(&chat, result);
+        let snapshot = assistant.snapshot();
+        publish(&app, &snapshot);
+        return Ok(snapshot);
+    }
+    let approved = assistant.approve(proposal_id).map_err(|e| e.message().to_string())?;
+    publish(&app, &assistant.snapshot());
+    let outcome = run_approved(&assistant, &approved);
+    let (snapshot, result) = assistant.finish(proposal_id, outcome);
+    assistant::settle(&chat, result);
+    publish(&app, &snapshot);
+    Ok(snapshot)
+}
+
+/// Cancels whatever the assistant is doing: the request, a waiting proposal, or an
+/// action that has not started yet.
+#[tauri::command]
+fn assistant_cancel(app: AppHandle, chat: State<Chat>, assistant: State<Assistant>) -> assistant::Snapshot {
+    let report = assistant.cancel();
+    assistant::settle(&chat, report.result);
+    publish(&app, &report.snapshot);
+    report.snapshot
 }
 
 #[tauri::command]
-fn chat_reset(chat: State<Chat>) {
+fn assistant_state(assistant: State<Assistant>) -> assistant::Snapshot {
+    assistant.snapshot()
+}
+
+#[tauri::command]
+fn chat_reset(app: AppHandle, chat: State<Chat>, assistant: State<Assistant>) {
+    assistant.reset();
     chat.reset();
+    publish(&app, &assistant.snapshot());
 }
 
 /// Copies a dropped file into the inbox and reports its name back. Only a path the
@@ -379,6 +524,11 @@ pub fn run() {
         })
         .manage(Pending::default())
         .manage(Chat::default())
+        .manage(Assistant::new(
+            executor::SystemLauncher,
+            executor::Files::inbox(),
+            actions::PolicyConfig::default(),
+        ))
         .manage(files::Grants::default())
         // The OS drop event is the only source of a path `ingest_file` will accept.
         // It is recorded here, in Rust, before the page is able to react to it.
@@ -409,6 +559,9 @@ pub fn run() {
             log_line,
             chat_send,
             chat_reset,
+            assistant_decide,
+            assistant_cancel,
+            assistant_state,
             ingest_file,
             secret_present,
             secret_set,

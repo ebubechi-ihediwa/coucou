@@ -2,6 +2,7 @@
 
 import type { BotEmoteName, BotStateName, IslandMode, IslandViewName } from "./layout";
 import type { EyeShape } from "../mochi/engine";
+import type { AssistantSnapshot } from "./bridge";
 
 export type AgentSource = "claudeCode" | "n8n" | "agent";
 export type PillBadge = "approval" | "finished" | "error";
@@ -137,6 +138,8 @@ class AppState {
   searchResult: SearchResult | null = null;
   chatHistory: ChatMessage[] = [];
   pendingApproval: ApprovalInfo | null = null;
+  /** Where the assistant stands: set from the `assistant` event Rust publishes. */
+  assistant: AssistantSnapshot = { phase: "idle", proposal: null, message: null };
 
   integrations: Record<string, IntegrationInfo> = {};
 

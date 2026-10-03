@@ -79,9 +79,17 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
 
     try {
       const reply = await Bridge.chatSend(query, context);
-      State.chatHistory.push({ id: nextId++, role: "assistant", content: reply.text });
       State.stateOverride = null;
-      Sound.play("finish");
+      if (reply.cancelled) {
+        // Stopped by the person. Rust dropped the unanswered message from the
+        // conversation; the log drops it too.
+        if (State.chatHistory.at(-1)?.role === "user") State.chatHistory.pop();
+      } else {
+        // A reply that is only a proposed action has no words; its card appears on
+        // its own (the `assistant` event) and brings its own sound.
+        if (reply.text) State.chatHistory.push({ id: nextId++, role: "assistant", content: reply.text });
+        if (!reply.proposal) Sound.play("finish");
+      }
     } catch (err) {
       State.stateOverride = null;
       State.noteMessage = String(err).replace(/^Error:\s*/, "");
@@ -95,7 +103,9 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
     }
   }
 
-  send.addEventListener("click", () => void submit());
+  // While a request is in flight the button is Stop: the person can always cancel.
+  send.addEventListener("click", () => (sending ? void Bridge.assistantCancel() : void submit()));
+  let showingStop = false;
   input.addEventListener("keydown", (e) => {
     if ((e as KeyboardEvent).key === "Enter") {
       e.preventDefault();
@@ -127,6 +137,14 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
 
       input.placeholder = State.chatHistory.length === 0 ? "Ask me anything…" : "Continue…";
       input.disabled = sending;
+      // Swapped only when it changes: rebuilding a button between a mouse-down and
+      // a mouse-up would swallow the click.
+      if (sending !== showingStop) {
+        showingStop = sending;
+        send.title = sending ? "Stop" : "Send";
+        clear(send);
+        send.append(svg(sending ? ICONS.xmark : ICONS.arrowUp, 11));
+      }
     },
     focus() {
       input.focus();
