@@ -344,6 +344,7 @@ mod tests {
         base: Duration::from_millis(10),
         cap: Duration::from_millis(40),
         deadline: Duration::from_secs(10),
+        attempt_timeout: Duration::from_secs(2),
     };
 
     fn client(ms: u64) -> reqwest::Client {
@@ -446,7 +447,7 @@ mod tests {
             let body = json!({});
             // Never answers: a timeout, and not asked twice.
             let mock = Mock::start(vec![Script::Hang]).await;
-            let err = super::call_at(&client(150), &mock.url("/"), "k", &body, &QUICK).await.unwrap_err();
+            let err = super::call_at(&client(150), &mock.url("/"), "k", &body, &Retry { attempt_timeout: Duration::from_millis(150), ..QUICK }).await.unwrap_err();
             assert_eq!(err, ApiError::Timeout);
             assert_eq!(mock.hits(), 1);
 

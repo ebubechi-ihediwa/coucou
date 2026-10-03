@@ -158,20 +158,28 @@ fn classify(err: reqwest::Error) -> ApiError {
 
 /// The service's own words for what went wrong, trimmed to something that fits a
 /// pill: `{"error":{"message":…}}`, `{"message":…}` or `{"error":"…"}`.
-fn error_message(body: &[u8]) -> Option<String> {
+///
+/// `secrets` are the credentials this request carried. A service may quote one back
+/// in an error ("invalid token abc123…"), and the message goes to the island and to
+/// the log file on disk, so every occurrence is replaced first. It is done before the
+/// length cut: cutting first could leave the front half of a key behind.
+fn error_message(body: &[u8], secrets: &[String]) -> Option<String> {
     let json: Value = serde_json::from_slice(body).ok()?;
     let text = json
         .pointer("/error/message")
         .or_else(|| json.get("message"))
         .or_else(|| json.get("error"))
         .and_then(Value::as_str)?;
-    let cleaned: String = text
+    let mut cleaned: String = text
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect::<String>()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
+    for secret in secrets {
+        cleaned = cleaned.replace(secret.as_str(), "[redacted]");
+    }
     if cleaned.is_empty() {
         return None;
     }
@@ -180,6 +188,68 @@ fn error_message(body: &[u8]) -> Option<String> {
         short.push('…');
     }
     Some(short)
+}
+
+/// The credentials a request carries, in every form a service might quote back: each
+/// header marked sensitive (by `secret`/`bearer`), the token after `Bearer`/`Basic`,
+/// the user and key inside a decoded `Basic` value, and a user or password written
+/// into the URL. Anything under four characters is not treated as one, so a short
+/// word cannot blank out ordinary text.
+fn secrets_of(request: &reqwest::Request) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for (_, value) in request.headers() {
+        if !value.is_sensitive() {
+            continue;
+        }
+        let Ok(text) = value.to_str() else { continue };
+        found.push(text.to_string());
+        if let Some(token) = text.strip_prefix("Bearer ") {
+            found.push(token.to_string());
+        }
+        if let Some(encoded) = text.strip_prefix("Basic ") {
+            found.push(encoded.to_string());
+            if let Some(decoded) = base64_decode(encoded) {
+                found.extend(decoded.split(':').map(str::to_string));
+                found.push(decoded);
+            }
+        }
+    }
+    let url = request.url();
+    found.push(url.username().to_string());
+    if let Some(password) = url.password() {
+        found.push(password.to_string());
+    }
+    found.retain(|s| s.chars().count() >= 4);
+    found.sort_by_key(|s| std::cmp::Reverse(s.len())); // longest first: no half-redacted overlaps
+    found.dedup();
+    found
+}
+
+/// Standard base64 (padding optional) to text, or `None` if it is not base64 or not
+/// UTF-8. Only used to recover the key inside a `Basic` credential, so that it can be
+/// kept out of messages (see `secrets_of`).
+fn base64_decode(input: &str) -> Option<String> {
+    let mut bytes = Vec::new();
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in input.bytes() {
+        let value = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            _ => return None,
+        } as u32;
+        acc = (acc << 6) | value;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// `Retry-After` in whole seconds. (The HTTP-date form is not read: none of the
@@ -215,6 +285,11 @@ fn redirect_policy() -> redirect::Policy {
 }
 
 fn redirect_allowed(from: &Url, to: &Url) -> bool {
+    // Never down from https to http, whatever the port: that would put the key on
+    // the wire in clear text.
+    if from.scheme() == "https" && to.scheme() != "https" {
+        return false;
+    }
     from.host_str() == to.host_str()
         && (from.port_or_known_default() == to.port_or_known_default()
             || (from.scheme() == "http" && to.scheme() == "https" && to.port().is_none()))
@@ -264,7 +339,12 @@ pub fn bearer(token: &str) -> Result<HeaderValue, ApiError> {
 
 /// Sends one request and returns the body of a successful answer.
 pub async fn send(request: RequestBuilder, max_body: usize) -> Result<Vec<u8>, ApiError> {
-    let mut response = request.send().await.map_err(classify)?;
+    // Built here rather than by `send()` so the credentials it carries are known
+    // before the answer arrives (see `error_message`).
+    let (client, request) = request.build_split();
+    let request = request.map_err(classify)?;
+    let secrets = secrets_of(&request);
+    let mut response = client.execute(request).await.map_err(classify)?;
     let status = response.status();
     if !status.is_success() {
         let retry_after = retry_after(response.headers());
@@ -275,7 +355,7 @@ pub async fn send(request: RequestBuilder, max_body: usize) -> Result<Vec<u8>, A
         let message = if status.as_u16() == 401 {
             None
         } else {
-            error_message(&body)
+            error_message(&body, &secrets)
         };
         return Err(ApiError::Status {
             code: status.as_u16(),
@@ -320,8 +400,13 @@ pub struct Retry {
     pub base: Duration,
     pub cap: Duration,
     /// Give up rather than start a wait that would end past this, counted from
-    /// the first attempt.
+    /// the first attempt. It also caps each attempt: one gets the smaller of
+    /// `attempt_timeout` and the time left, so the whole exchange, slow answers
+    /// included, ends within the deadline.
     pub deadline: Duration,
+    /// The longest one attempt may take (headers and body). It replaces the
+    /// client's own timeout for these requests, so it should match it.
+    pub attempt_timeout: Duration,
 }
 
 /// For the chat: a message request changes nothing on the server, so asking again
@@ -332,6 +417,7 @@ pub const CHAT_RETRY: Retry = Retry {
     base: Duration::from_secs(1),
     cap: Duration::from_secs(8),
     deadline: Duration::from_secs(100),
+    attempt_timeout: CHAT_TIMEOUT,
 };
 
 /// How long to wait before retry number `attempt + 1`, or `None` to stop. Half the
@@ -370,7 +456,14 @@ pub async fn send_retrying(
     let started = Instant::now();
     let mut attempt = 0;
     loop {
-        let err = match send(make(), max_body).await {
+        // No attempt may run past the overall deadline, however slow the answer.
+        let timeout = retry
+            .attempt_timeout
+            .min(retry.deadline.saturating_sub(started.elapsed()));
+        if timeout.is_zero() {
+            return Err(ApiError::Timeout);
+        }
+        let err = match send(make().timeout(timeout), max_body).await {
             Ok(body) => return Ok(body),
             Err(err) => err,
         };
@@ -588,6 +681,7 @@ pub(crate) mod tests {
         base: Duration::from_millis(10),
         cap: Duration::from_millis(40),
         deadline: Duration::from_secs(10),
+        attempt_timeout: Duration::from_secs(2),
     };
 
     // ── The matrix, against a local server ───────────────────────────────────
@@ -633,6 +727,7 @@ pub(crate) mod tests {
             code: 403,
             message: error_message(
                 br#"{"error":{"code":"forbidden","message":"Not authorized","invalidToken":true}}"#,
+                &[],
             ),
             retry_after: None,
         };
@@ -644,6 +739,7 @@ pub(crate) mod tests {
             code: 400,
             message: error_message(
                 br#"{"statusCode":400,"message":"API key is invalid","name":"validation_error"}"#,
+                &[],
             ),
             retry_after: None,
         };
@@ -706,16 +802,16 @@ pub(crate) mod tests {
     #[test]
     fn error_messages_are_cleaned_and_shortened() {
         let long = format!(r#"{{"message":"{}"}}"#, "a".repeat(500));
-        let msg = error_message(long.as_bytes()).unwrap();
+        let msg = error_message(long.as_bytes(), &[]).unwrap();
         assert_eq!(msg.chars().count(), MESSAGE_MAX_CHARS + 1);
         assert!(msg.ends_with('…'));
         assert_eq!(
-            error_message(br#"{"error":"line one\nline\ttwo"}"#).unwrap(),
+            error_message(br#"{"error":"line one\nline\ttwo"}"#, &[]).unwrap(),
             "line one line two"
         );
-        assert_eq!(error_message(b"<html>502 Bad Gateway</html>"), None);
-        assert_eq!(error_message(br#"{"message":"   "}"#), None);
-        assert_eq!(error_message(br#"{"message":42}"#), None);
+        assert_eq!(error_message(b"<html>502 Bad Gateway</html>", &[]), None);
+        assert_eq!(error_message(br#"{"message":"   "}"#, &[]), None);
+        assert_eq!(error_message(br#"{"message":42}"#, &[]), None);
     }
 
     #[test]
@@ -850,9 +946,16 @@ pub(crate) mod tests {
             let mock = Mock::start(vec![Script::Hang]).await;
             let c = client(150);
             let started = Instant::now();
-            let err = send_retrying(|| c.get(mock.url("/")), MAX, &QUICK)
-                .await
-                .unwrap_err();
+            let err = send_retrying(
+                || c.get(mock.url("/")),
+                MAX,
+                &Retry {
+                    attempt_timeout: Duration::from_millis(150),
+                    ..QUICK
+                },
+            )
+            .await
+            .unwrap_err();
             assert_eq!(err, ApiError::Timeout);
             assert_eq!(err.describe(""), "Timed out");
             assert!(
@@ -955,6 +1058,7 @@ pub(crate) mod tests {
             base: Duration::from_secs(1),
             cap: Duration::from_secs(8),
             deadline: Duration::from_secs(100),
+            attempt_timeout: Duration::from_secs(90),
         };
         // At the low end of the jitter the wait is half the exponential; at the
         // high end it is the whole of it.
@@ -1155,6 +1259,155 @@ pub(crate) mod tests {
             &u("http://n8n.example.com/"),
             &u("https://n8n.example.com:444/")
         ));
+    }
+
+    // ── Found in review of the merged code ───────────────────────────────────
+
+    #[test]
+    fn a_redirect_never_steps_down_from_https_to_http() {
+        let u = |s: &str| Url::parse(s).unwrap();
+        // Same host and the same (explicit) port: only the scheme changes, and the key
+        // would travel in clear text.
+        assert!(!redirect_allowed(
+            &u("https://n8n.example.com:8080/"),
+            &u("http://n8n.example.com:8080/")
+        ));
+        assert!(!redirect_allowed(
+            &u("https://n8n.example.com/"),
+            &u("http://n8n.example.com:443/")
+        ));
+        // The other direction, on the same port, is an upgrade and stays allowed.
+        assert!(redirect_allowed(
+            &u("http://n8n.example.com:8080/"),
+            &u("https://n8n.example.com:8080/")
+        ));
+    }
+
+    #[test]
+    fn a_provider_cannot_make_a_credential_appear_in_an_error_message() {
+        run(async {
+            let c = client(2000);
+            // A server that quotes the credential back in its error, for each way
+            // Coucou sends one.
+            let echo = |token: &str| {
+                reply(
+                    403,
+                    &format!(r#"{{"error":{{"message":"rejected {token} for this request"}}}}"#),
+                )
+            };
+
+            // Bearer token.
+            let mock = Mock::start(vec![echo("tok-bearer-12345")]).await;
+            let err = send(
+                c.get(mock.url("/"))
+                    .header("authorization", bearer("tok-bearer-12345").unwrap()),
+                MAX,
+            )
+            .await
+            .unwrap_err();
+            let shown = err.describe("forbidden");
+            assert!(!shown.contains("tok-bearer-12345"), "{shown}");
+            assert!(!format!("{err:?}").contains("tok-bearer-12345"));
+            assert!(shown.contains("[redacted]"), "{shown}");
+
+            // A custom key header (x-api-key, X-N8N-API-KEY).
+            let mock = Mock::start(vec![echo("sk-custom-header-key")]).await;
+            let err = send(
+                c.get(mock.url("/"))
+                    .header("x-n8n-api-key", secret("sk-custom-header-key").unwrap()),
+                MAX,
+            )
+            .await
+            .unwrap_err();
+            assert!(!err.describe("").contains("sk-custom-header-key"));
+
+            // Basic auth: the server may quote either the encoded value or the key itself.
+            let basic = secret("Basic c2stbGl2ZV9zZWNyZXRrZXk6").unwrap(); // "sk-live_secretkey:"
+            for quoted in ["c2stbGl2ZV9zZWNyZXRrZXk6", "sk-live_secretkey"] {
+                let mock = Mock::start(vec![echo(quoted)]).await;
+                let err = send(
+                    c.get(mock.url("/")).header("authorization", basic.clone()),
+                    MAX,
+                )
+                .await
+                .unwrap_err();
+                let shown = err.describe("");
+                assert!(!shown.contains(quoted), "{quoted} leaked: {shown}");
+            }
+
+            // A credential in the URL (an n8n address with a user and password).
+            let mock = Mock::start(vec![echo("p4ssw0rd-in-url")]).await;
+            let url = format!("http://admin:p4ssw0rd-in-url@{}/", mock.addr);
+            let err = send(c.get(url), MAX).await.unwrap_err();
+            assert!(!err.describe("").contains("p4ssw0rd-in-url"));
+
+            // A secret cut in half by the length limit must not leave its first half behind.
+            let padding = "x".repeat(MESSAGE_MAX_CHARS - 8);
+            let body = format!(r#"{{"message":"{padding}tok-split-across-the-limit"}}"#);
+            let mock = Mock::start(vec![reply(400, &body)]).await;
+            let err = send(
+                c.get(mock.url("/")).header(
+                    "authorization",
+                    bearer("tok-split-across-the-limit").unwrap(),
+                ),
+                MAX,
+            )
+            .await
+            .unwrap_err();
+            let shown = err.describe("");
+            assert!(!shown.contains("tok-spl"), "{shown}");
+
+            // Ordinary explanations still come through untouched.
+            let mock = Mock::start(vec![reply(400, r#"{"message":"API key is invalid"}"#)]).await;
+            let err = send(
+                c.get(mock.url("/"))
+                    .header("authorization", bearer("tok-bearer-12345").unwrap()),
+                MAX,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                err.describe(""),
+                "Request rejected (400) — API key is invalid"
+            );
+        });
+    }
+
+    #[test]
+    fn base64_decoding_reads_what_the_encoder_wrote() {
+        assert_eq!(base64_decode("Zm9vOg==").as_deref(), Some("foo:"));
+        assert_eq!(base64_decode("Zm9vOg").as_deref(), Some("foo:"));
+        assert_eq!(
+            base64_decode("c2stbGl2ZV9zZWNyZXRrZXk6").as_deref(),
+            Some("sk-live_secretkey:")
+        );
+        assert_eq!(base64_decode("not base64!"), None);
+        assert_eq!(base64_decode("").as_deref(), Some(""));
+    }
+
+    #[test]
+    fn the_overall_deadline_also_limits_one_slow_attempt() {
+        run(async {
+            // The service never answers. The client would wait 3 s, but the retry
+            // budget is 400 ms, and that is what ends it.
+            let mock = Mock::start(vec![Script::Hang]).await;
+            let c = client(3000);
+            let tight = Retry {
+                deadline: Duration::from_millis(400),
+                ..QUICK
+            };
+            let started = Instant::now();
+            let err = send_retrying(|| c.get(mock.url("/")), MAX, &tight)
+                .await
+                .unwrap_err();
+            assert_eq!(err, ApiError::Timeout);
+            assert!(
+                started.elapsed() < Duration::from_millis(1500),
+                "{:?}",
+                started.elapsed()
+            );
+            assert_eq!(mock.hits(), 1);
+        });
     }
 
     #[test]
