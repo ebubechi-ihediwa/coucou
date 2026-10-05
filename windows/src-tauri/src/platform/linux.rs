@@ -126,8 +126,19 @@ pub fn no_console(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+/// Hands a link to the default handler and says whether that could be started.
+pub fn try_open_url(url: &str) -> std::io::Result<()> {
+    Command::new("xdg-open").arg(url).spawn().map(|_| ())
+}
+
 pub fn open_url(url: &str) {
-    let _ = Command::new("xdg-open").arg(url).spawn();
+    let _ = try_open_url(url);
+}
+
+/// Opens a file with the program the desktop has chosen for its type. Callers must
+/// only pass files whose type they have vetted; see `executor::OPENABLE_EXTENSIONS`.
+pub fn try_open_path(path: &std::path::Path) -> std::io::Result<()> {
+    Command::new("xdg-open").arg(path).spawn().map(|_| ())
 }
 
 pub fn reveal_folder(path: &str) {

@@ -21,6 +21,10 @@ export interface ViewActions {
   openTarget(): void;
   openUrl(url: string): void;
   decide(d: "allow" | "deny"): void;
+  /** Answer the assistant's proposed action. Rust validates and runs it; this only asks. */
+  decideAction(approve: boolean): void;
+  /** Stop the assistant: the request, a waiting proposal, or an action not yet started. */
+  cancelAssistant(): void;
   toggleSound(): void;
   setVolume(v: number): void;
   setAutoClose(seconds: number): void;
@@ -317,6 +321,62 @@ function buildApproval(actions: ViewActions): ViewHost {
   };
 }
 
+// ── Assistant action ──────────────────────────────────────────────────────────
+
+/**
+ * An action Mochi wants to take, said plainly ("Open Notepad", "Open example.com in
+ * your browser") with the whole link or file name beneath it, and the two answers.
+ * Everything shown comes from Rust; nothing here decides what will happen.
+ */
+function buildAction(actions: ViewActions): ViewHost {
+  const who = h("div");
+  const title = h("div", { class: "title" });
+  const target = h("div", { class: "code" });
+  const note = h("div", { class: "sub" });
+  const row = h("div", { class: "actions" });
+  const el = h("div", { class: "view" }, card("amber", stack(116, 16, who, title, target, note, row)));
+  let rowKey = "";
+  return {
+    el,
+    sync() {
+      const { phase, proposal, message } = State.assistant;
+      clear(who);
+      who.append(agentWho(null, phase === "awaiting_approval" ? "Mochi wants to" : "Mochi"));
+
+      title.textContent = proposal?.title ?? message ?? "";
+      target.textContent = proposal?.target ?? "";
+      target.style.display = proposal?.target ? "" : "none";
+
+      if (phase === "awaiting_approval") {
+        note.textContent =
+          proposal?.risk === "low"
+            ? "Nothing happens unless you allow it."
+            : "Check the address first. Nothing happens unless you allow it.";
+      } else if (phase === "executing") {
+        note.textContent = "Opening…";
+      } else {
+        // The result is the title ("Opened Notepad."); there is nothing to add.
+        note.textContent = "";
+      }
+
+      // Built once per state. Rebuilding buttons between a mouse-down and a
+      // mouse-up would swallow the click.
+      const key = `${phase}:${proposal?.id ?? 0}`;
+      if (rowKey === key) return;
+      rowKey = key;
+      clear(row);
+      if (phase === "awaiting_approval") {
+        row.append(
+          btn("Deny", "secondary", () => actions.decideAction(false)),
+          btn("Allow", "primary", () => actions.decideAction(true)),
+        );
+      } else if (phase === "executing") {
+        row.append(btn("Cancel", "secondary", () => actions.cancelAssistant()));
+      }
+    },
+  };
+}
+
 // ── Question ──────────────────────────────────────────────────────────────────
 
 function buildQuestion(): ViewHost {
@@ -491,6 +551,7 @@ export function buildViews(
   map.set("overview", buildOverview(actions));
   map.set("empty", buildEmpty(actions));
   map.set("approval", buildApproval(actions));
+  map.set("action", buildAction(actions));
   map.set("question", buildQuestion());
   map.set("error", buildError(actions));
   map.set("finished", buildFinished(actions));

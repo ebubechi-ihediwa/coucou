@@ -158,6 +158,24 @@ The app icon and the tray icon are drawn in code, like Mochi itself:
 npm run icons          # regenerates src-tauri/icons from scripts/gen-icons.mjs
 ```
 
+### Assistant actions
+
+In the chat, Mochi can propose one small action on your computer: open Notepad,
+Calculator or File Explorer, open an `http(s)` link in your browser, or open a
+document or image you attached. The island shows exactly what it intends ("Open
+Notepad", or the whole link) and nothing happens unless you press **Allow**; **Deny**
+withdraws it, and **Stop** cancels a request in flight.
+
+The model never gets operating-system access. It can only call one tool
+(`propose_action`); what it sends is parsed in Rust against a closed list of three
+action kinds (`actions.rs`), judged by a policy, and carried out by a separate
+executor (`executor.rs`) that checks it again. There is no command line, executable
+path or file path anywhere in an action: applications are a fixed list launched from
+`System32`, links are `http`/`https` without credentials, and files are opaque ids
+that resolve only to documents and images inside the inbox. `assistant.rs` is the
+state machine (`idle`, `thinking`, `awaiting_approval`, `executing`, `completed`,
+`failed`, `cancelled`). Opening applications is Windows-only for now.
+
 ### Idle resource use
 
 The island must cost nothing while hidden. [PERFORMANCE.md](PERFORMANCE.md) lists what

@@ -5,6 +5,7 @@ import { Bridge, IS_TAURI, onEvent } from "./core/bridge";
 import { Sound } from "./core/sound";
 import { State, type Settings } from "./core/state";
 import { Island } from "./island/island";
+import { registerAssistantHandlers } from "./island/assistant";
 import { registerHookHandlers } from "./island/hooks";
 import { registerIntegrationHandlers, refreshConfigured } from "./island/integrations";
 
@@ -62,6 +63,7 @@ async function main() {
   });
 
   registerHookHandlers(island);
+  registerAssistantHandlers(island);
   registerIntegrationHandlers(island);
 
   island.launch();

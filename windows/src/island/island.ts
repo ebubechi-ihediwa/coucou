@@ -147,6 +147,18 @@ export class Island {
         State.setPillBadge("integration_claude", null);
         this.setView(State.defaultView());
       },
+      decideAction: (approve) => {
+        const proposal = State.assistant.proposal;
+        if (!proposal) return;
+        Sound.play(approve ? "approve" : "blip");
+        // The card stays up until Rust answers; its `assistant` events drive what it
+        // shows (executing, then the result).
+        void Bridge.assistantDecide(proposal.id, approve).catch((err) => {
+          State.noteMessage = String(err).replace(/^Error:\s*/, "");
+          this.setView("note");
+        });
+      },
+      cancelAssistant: () => void Bridge.assistantCancel(),
       toggleSound: () => {
         State.settings.soundEnabled = !State.settings.soundEnabled;
         Sound.setEnabled(State.settings.soundEnabled);

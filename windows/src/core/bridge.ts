@@ -83,8 +83,16 @@ export const Bridge = {
   // ── Chat, files, secrets ──────────────────────────────────────────────────
   /** One chat turn. The API key and any file bytes never leave Rust. */
   chatSend: (query: string, context: ChatContext | null) =>
-    callOrThrow<{ text: string }>("chat_send", { query, context }),
+    callOrThrow<ChatReply>("chat_send", { query, context }),
   chatReset: () => call<void>("chat_reset"),
+  /**
+   * The person's answer to a proposed action. Rust checks it again and carries it
+   * out; nothing here can make it do anything that was not proposed and approved.
+   */
+  assistantDecide: (proposalId: number, approve: boolean) =>
+    callOrThrow<AssistantSnapshot>("assistant_decide", { proposalId, approve }),
+  /** Stops whatever the assistant is doing: the request, a waiting proposal, or an action not yet started. */
+  assistantCancel: () => call<AssistantSnapshot>("assistant_cancel"),
   /** Copies a dropped file into the inbox. */
   ingestFile: (path: string) => callOrThrow<DroppedFile>("ingest_file", { path }),
   /** Only ever tells you whether a key exists — never its value. */
@@ -111,6 +119,39 @@ export interface IntegrationUpdate {
 export type ChatContext =
   | { kind: "file"; name: string; path: string }
   | { kind: "window"; appName: string; title: string; url?: string };
+
+/** An action the assistant proposes, as Rust describes it. The page only displays it. */
+export interface ActionProposal {
+  id: number;
+  kind: string;
+  /** "Open Notepad" — what will happen, said plainly. */
+  title: string;
+  /** The link or file name behind the title, when there is one. */
+  target: string | null;
+  risk: "low" | "medium" | "high";
+}
+
+export type AssistantPhase =
+  | "idle"
+  | "thinking"
+  | "awaiting_approval"
+  | "executing"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface AssistantSnapshot {
+  phase: AssistantPhase;
+  proposal: ActionProposal | null;
+  message: string | null;
+}
+
+export interface ChatReply {
+  text: string;
+  proposal: ActionProposal | null;
+  /** The person cancelled; there is nothing to show. */
+  cancelled: boolean;
+}
 
 export interface DroppedFile {
   name: string;

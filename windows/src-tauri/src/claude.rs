@@ -6,9 +6,12 @@
 
 use std::sync::Mutex;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
+use crate::actions;
+use crate::assistant::{RawProposal, ToolResult};
+use crate::executor::Files;
 use crate::{files, http, log, secrets};
 
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
@@ -25,24 +28,46 @@ pub const DEFAULT_MODEL: &str = "claude-opus-5";
 const SYSTEM_PROMPT: &str = "You are Mochi, a personal AI assistant living at the top of the user's screen. \
 You have web search access and can help with absolutely anything — research, coding, finding places, recommendations, tasks, questions. \
 Respond in the user's language. Be thorough and complete — use as much detail as the task requires. \
-No markdown formatting (no **, no ##, no bullet dashes). Use plain text with line breaks.";
+No markdown formatting (no **, no ##, no bullet dashes). Use plain text with line breaks. \
+You can also act on the user's computer, within narrow limits: when the user clearly asks you to open an application, a web page or a file they attached, call the propose_action tool. \
+Coucou shows the user exactly what you propose and does it only if they approve, then tells you how it went. Never say something has been done before you are told so. \
+If a request needs anything the tool cannot do, say so in plain words instead.";
 
 #[derive(Default)]
 pub struct Chat {
     /// Full multi-turn history, including tool_use / tool_result blocks.
     messages: Mutex<Vec<Value>>,
+    /// Answers owed to the model's tool uses, carried by the next user message.
+    /// The API refuses a conversation in which a tool use has no answer.
+    tool_results: Mutex<Vec<ToolResult>>,
 }
 
 impl Chat {
     pub fn reset(&self) {
         self.messages.lock().unwrap().clear();
+        self.tool_results.lock().unwrap().clear();
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn add_tool_result(&self, result: ToolResult) {
+        self.tool_results.lock().unwrap().push(result);
+    }
+
+    pub(crate) fn take_tool_results(&self) -> Vec<ToolResult> {
+        std::mem::take(&mut *self.tool_results.lock().unwrap())
+    }
+
+    /// Puts back what a failed request had taken, ahead of anything added since.
+    fn restore_tool_results(&self, mut taken: Vec<ToolResult>) {
+        let mut held = self.tool_results.lock().unwrap();
+        taken.append(&mut held);
+        *held = taken;
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
         self.messages.lock().unwrap().is_empty()
     }
 
-    fn push(&self, message: Value) {
+    pub(crate) fn push(&self, message: Value) {
         self.messages.lock().unwrap().push(message);
     }
 
@@ -50,7 +75,7 @@ impl Chat {
         self.messages.lock().unwrap().pop();
     }
 
-    fn snapshot(&self) -> Vec<Value> {
+    pub(crate) fn snapshot(&self) -> Vec<Value> {
         self.messages.lock().unwrap().clone()
     }
 }
@@ -62,24 +87,66 @@ pub enum ChatContext {
     Window { app_name: String, title: String, url: Option<String> },
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ChatReply {
+/// What a chat turn produced: the model's words, and the action it asked for, if
+/// any. The action is still untrusted; the runtime decides what becomes of it.
+pub struct ModelReply {
     pub text: String,
+    pub proposal: Option<RawProposal>,
 }
 
-/// One chat turn. Returns the assistant's text, or a message the island shows
-/// in the note view.
+/// One chat turn. Returns the assistant's text and any proposed action, or a
+/// message the island shows in the note view.
 pub async fn send(
     chat: &Chat,
     model: &str,
     query: String,
     context: Option<ChatContext>,
-) -> Result<ChatReply, String> {
+    files: &Files,
+) -> Result<ModelReply, String> {
+    // Answers owed from the last turn go first. Unless the turn completes they are
+    // put back, so the conversation stays one the API will accept; see `TurnGuard`.
+    let owed = chat.take_tool_results();
+    let mut guard = TurnGuard { chat, owed: owed.clone(), pushed: false, done: false };
+    send_turn(chat, model, query, context, files, &owed, &mut guard).await
+}
+
+/// Keeps the conversation consistent however a turn ends. If the turn fails, or its
+/// future is simply dropped because the person cancelled mid-request, the user
+/// message it added is removed and the answers it took are given back; otherwise
+/// the next request would carry a message the model never answered, or lose a
+/// tool result the API insists on.
+struct TurnGuard<'a> {
+    chat: &'a Chat,
+    owed: Vec<ToolResult>,
+    pushed: bool,
+    done: bool,
+}
+
+impl Drop for TurnGuard<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        if self.pushed {
+            self.chat.pop();
+        }
+        self.chat.restore_tool_results(std::mem::take(&mut self.owed));
+    }
+}
+
+async fn send_turn(
+    chat: &Chat,
+    model: &str,
+    query: String,
+    context: Option<ChatContext>,
+    files: &Files,
+    owed: &[ToolResult],
+    guard: &mut TurnGuard<'_>,
+) -> Result<ModelReply, String> {
     let key = secrets::get("anthropic-api-key")
         .ok_or_else(|| "API key missing. Open settings.".to_string())?;
 
-    let mut content: Vec<Value> = Vec::new();
+    let mut content: Vec<Value> = tool_result_blocks(owed);
 
     // File / window context rides along with the first message only, exactly
     // like ClaudeService.chat().
@@ -90,7 +157,15 @@ pub async fn send(
                 if let Some(block) = file_block(path)? {
                     content.push(block);
                 }
-                content.push(json!({ "type": "text", "text": format!("File: {name}") }));
+                // The model gets an opaque id for the file, never its path.
+                let note = match files.register(std::path::Path::new(path)) {
+                    Ok((id, _)) => format!(
+                        "File: {name} (fileId: {}; Coucou can open it for the user with open_file)",
+                        id.as_str()
+                    ),
+                    Err(_) => format!("File: {name}"),
+                };
+                content.push(json!({ "type": "text", "text": note }));
             }
             Some(ChatContext::Window { app_name, title, url }) => {
                 let mut text = format!("Context — App: {app_name}, Window: {title}");
@@ -105,27 +180,16 @@ pub async fn send(
     content.push(json!({ "type": "text", "text": query }));
 
     chat.push(json!({ "role": "user", "content": content }));
+    guard.pushed = true;
 
-    let body = json!({
-        "model": model,
-        "max_tokens": MAX_TOKENS,
-        "system": SYSTEM_PROMPT,
-        "tools": [{ "type": "web_search_20260209", "name": "web_search", "max_uses": 5 }],
-        "fallbacks": "default",
-        "messages": chat.snapshot(),
-    });
+    let body = request_body(model, chat.snapshot());
 
-    let response = match call(&key, &body).await {
-        Ok(v) => v,
-        Err(err) => {
-            chat.pop(); // keep the history consistent with what the model saw
-            return Err(err);
-        }
-    };
+    // From here an early return (or a dropped future) undoes the user message, via
+    // the guard, so the history stays consistent with what the model saw.
+    let response = call(&key, &body).await?;
 
     // A policy decline comes back as HTTP 200 with stop_reason "refusal".
     if response.get("stop_reason").and_then(Value::as_str) == Some("refusal") {
-        chat.pop();
         let why = response
             .get("stop_details")
             .and_then(|d| d.get("explanation"))
@@ -135,14 +199,66 @@ pub async fn send(
     }
 
     let Some(blocks) = response.get("content").and_then(Value::as_array).cloned() else {
-        chat.pop();
         return Err("Unexpected API response.".into());
     };
 
     // Store the whole content — tool_use / tool_result blocks included — so the
-    // next turn has the right context.
+    // next turn has the right context. The exchange is kept from here on.
     chat.push(json!({ "role": "assistant", "content": blocks.clone() }));
+    guard.done = true;
 
+    let Interpreted { text, proposal, unanswered } = interpret(&blocks);
+    // Any tool use but the one proposal still owes the model an answer.
+    for result in unanswered {
+        chat.add_tool_result(result);
+    }
+
+    if text.is_empty() && proposal.is_none() {
+        return Err("No response text.".into());
+    }
+    Ok(ModelReply { text, proposal })
+}
+
+/// The basic web search. The newer `web_search_20260209` filters results by running
+/// code, which the fallback model does not support, so with `"fallbacks": "default"`
+/// the API refuses the whole request before any model answers.
+const WEB_SEARCH_TOOL: &str = "web_search_20250305";
+
+/// The request for one turn: the conversation, the web search the model has always
+/// had, and the single tool through which it may ask Coucou to act.
+pub(crate) fn request_body(model: &str, messages: Vec<Value>) -> Value {
+    json!({
+        "model": model,
+        "max_tokens": MAX_TOKENS,
+        "system": SYSTEM_PROMPT,
+        "tools": [
+            { "type": WEB_SEARCH_TOOL, "name": "web_search", "max_uses": 5 },
+            actions::tool_definition(),
+        ],
+        "fallbacks": "default",
+        "messages": messages,
+    })
+}
+
+pub(crate) fn tool_result_blocks(results: &[ToolResult]) -> Vec<Value> {
+    results
+        .iter()
+        .map(|r| json!({ "type": "tool_result", "tool_use_id": r.tool_use_id, "content": r.text }))
+        .collect()
+}
+
+pub(crate) struct Interpreted {
+    pub text: String,
+    pub proposal: Option<RawProposal>,
+    /// Tool uses that will not be acted on, with the answer to give for each.
+    pub unanswered: Vec<ToolResult>,
+}
+
+/// Reads a response's content blocks. The first `propose_action` call is the
+/// proposal. A second one, or a call to any other client tool, is not acted on and
+/// is answered at once, so that the conversation stays well formed. What the model
+/// put in a call is not looked at here at all; that is `actions::Action::parse`'s job.
+pub(crate) fn interpret(blocks: &[Value]) -> Interpreted {
     let text = blocks
         .iter()
         .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
@@ -152,17 +268,46 @@ pub async fn send(
         .trim()
         .to_string();
 
-    if text.is_empty() {
-        return Err("No response text.".into());
+    let mut proposal = None;
+    let mut unanswered = Vec::new();
+    for block in blocks.iter().filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use")) {
+        // A call with no id cannot be answered; the API would not have produced one.
+        let Some(id) = block.get("id").and_then(Value::as_str) else { continue };
+        let is_ours = block.get("name").and_then(Value::as_str) == Some(actions::TOOL_NAME);
+        if is_ours && proposal.is_none() {
+            proposal = Some(RawProposal { tool_use_id: id.to_string(), input: block.get("input").cloned().unwrap_or(Value::Null) });
+        } else {
+            let why = if is_ours {
+                "Only one action can be proposed at a time, so this one was not performed."
+            } else {
+                "That tool is not available, so nothing was done."
+            };
+            unanswered.push(ToolResult { tool_use_id: id.to_string(), text: why.into() });
+        }
     }
-    Ok(ChatReply { text })
+    Interpreted { text, proposal, unanswered }
 }
 
 async fn call(key: &str, body: &Value) -> Result<Value, String> {
-    let client = http::chat_client().map_err(|e| chat_error(&e))?;
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("?");
+    let failed = |e: http::ApiError| {
+        let shown = chat_error(&e);
+        log::line(failure_line(model, &shown));
+        shown
+    };
+    let client = http::chat_client().map_err(failed)?;
     call_at(&client, ENDPOINT, key, body, &http::CHAT_RETRY)
         .await
-        .map_err(|e| chat_error(&e))
+        .map_err(failed)
+}
+
+/// What the log keeps of a failed request: the model and the same words the island
+/// shows. The API's own explanation (an unsupported tool, an unknown model) is what
+/// says why a request was rejected, and the island cuts it short. The text carries
+/// neither the key nor the response body: `http` removes the key from the API's
+/// message before it is kept, and `chat_error` never includes the body or the URL.
+fn failure_line(model: &str, shown: &str) -> String {
+    format!("chat request failed (model {model}): {shown}")
 }
 
 /// One message request. A message changes nothing on the server, so the
@@ -332,6 +477,134 @@ mod tests {
         }
     }
 
+    // ── The model's side of an action ────────────────────────────────────────
+
+    use super::{interpret, request_body, tool_result_blocks, Chat, TurnGuard};
+    use crate::assistant::ToolResult;
+
+    fn tool_use(id: &str, name: &str, input: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "type": "tool_use", "id": id, "name": name, "input": input })
+    }
+
+    #[test]
+    fn the_request_offers_the_web_search_and_exactly_one_tool_for_acting() {
+        let body = request_body("claude-opus-5", vec![]);
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], "web_search");
+        // Not the code-running variant: the fallback model rejects it (a live 400).
+        assert_eq!(tools[0]["type"], "web_search_20250305");
+        assert_eq!(body["fallbacks"], "default");
+        assert!(tools.iter().all(|t| t.get("allowed_callers").is_none()));
+        assert_eq!(tools[1]["name"], crate::actions::TOOL_NAME);
+        // The schema forbids anything the parser would refuse.
+        assert_eq!(tools[1]["input_schema"]["additionalProperties"], false);
+        // The model is told what the tool is for, and not to claim it was done.
+        let system = body["system"].as_str().unwrap();
+        assert!(system.contains("propose_action") && system.contains("Never say something has been done"));
+    }
+
+    #[test]
+    fn a_tool_call_in_a_response_becomes_a_proposal_and_text_stays_text() {
+        let blocks = vec![
+            serde_json::json!({ "type": "text", "text": "Opening it." }),
+            tool_use("toolu_1", "propose_action", serde_json::json!({ "type": "open_app", "app": "notepad" })),
+        ];
+        let found = interpret(&blocks);
+        assert_eq!(found.text, "Opening it.");
+        let proposal = found.proposal.unwrap();
+        assert_eq!(proposal.tool_use_id, "toolu_1");
+        assert_eq!(proposal.input, serde_json::json!({ "type": "open_app", "app": "notepad" }));
+        assert!(found.unanswered.is_empty());
+        // No tool call, no proposal.
+        let plain = interpret(&[serde_json::json!({ "type": "text", "text": "Hello." })]);
+        assert!(plain.proposal.is_none() && plain.unanswered.is_empty());
+    }
+
+    #[test]
+    fn extra_and_unknown_tool_calls_are_not_acted_on_but_are_answered() {
+        let blocks = vec![
+            tool_use("a", "propose_action", serde_json::json!({ "type": "open_app", "app": "notepad" })),
+            tool_use("b", "propose_action", serde_json::json!({ "type": "open_app", "app": "calculator" })),
+            tool_use("c", "run_shell", serde_json::json!({ "command": "calc" })),
+        ];
+        let found = interpret(&blocks);
+        assert_eq!(found.proposal.unwrap().tool_use_id, "a", "only the first is proposed");
+        let ids: Vec<&str> = found.unanswered.iter().map(|r| r.tool_use_id.as_str()).collect();
+        assert_eq!(ids, ["b", "c"], "every other call still gets an answer");
+        assert!(found.unanswered.iter().all(|r| r.text.contains("not") || r.text.contains("nothing")));
+    }
+
+    #[test]
+    fn a_tool_call_without_an_id_or_with_junk_input_cannot_become_a_valid_action() {
+        // No id: cannot be answered, so it is ignored.
+        let found = interpret(&[serde_json::json!({ "type": "tool_use", "name": "propose_action", "input": {} })]);
+        assert!(found.proposal.is_none());
+        // Junk input is passed on as is; the parser refuses it later.
+        let found = interpret(&[serde_json::json!({ "type": "tool_use", "id": "x", "name": "propose_action" })]);
+        assert_eq!(found.proposal.unwrap().input, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn answers_owed_to_the_model_come_first_in_the_next_message() {
+        let owed = vec![
+            ToolResult { tool_use_id: "toolu_1".into(), text: "The user approved and Coucou did it: Opened Notepad.".into() },
+            ToolResult { tool_use_id: "toolu_2".into(), text: "nothing was done".into() },
+        ];
+        let blocks = tool_result_blocks(&owed);
+        assert_eq!(blocks[0], serde_json::json!({ "type": "tool_result", "tool_use_id": "toolu_1", "content": "The user approved and Coucou did it: Opened Notepad." }));
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks.iter().all(|b| b["type"] == "tool_result"));
+    }
+
+    #[test]
+    fn owed_answers_are_taken_once_and_given_back_ahead_of_newer_ones() {
+        let chat = Chat::default();
+        let r = |id: &str| ToolResult { tool_use_id: id.into(), text: id.into() };
+        chat.add_tool_result(r("old"));
+        let taken = chat.take_tool_results();
+        assert_eq!(taken.len(), 1);
+        assert!(chat.take_tool_results().is_empty(), "taken, not copied");
+        chat.add_tool_result(r("new"));
+        chat.restore_tool_results(taken);
+        let ids: Vec<String> = chat.take_tool_results().into_iter().map(|r| r.tool_use_id).collect();
+        assert_eq!(ids, ["old", "new"]);
+        chat.add_tool_result(r("x"));
+        chat.reset();
+        assert!(chat.take_tool_results().is_empty(), "a new conversation owes nothing");
+    }
+
+    #[test]
+    fn a_turn_that_is_dropped_leaves_the_conversation_as_it_was() {
+        // The person cancels mid-request: the future is simply dropped.
+        let chat = Chat::default();
+        chat.add_tool_result(ToolResult { tool_use_id: "toolu_1".into(), text: "done".into() });
+        let owed = chat.take_tool_results();
+        {
+            let mut guard = TurnGuard { chat: &chat, owed: owed.clone(), pushed: false, done: false };
+            chat.push(serde_json::json!({ "role": "user", "content": "open notepad" }));
+            guard.pushed = true;
+            // dropped here, before the model answered
+        }
+        assert!(chat.is_empty(), "the unanswered message is gone");
+        assert_eq!(chat.take_tool_results(), owed, "and the answer it carried is owed again");
+    }
+
+    #[test]
+    fn a_completed_turn_keeps_its_messages_and_does_not_give_answers_back() {
+        let chat = Chat::default();
+        let owed = vec![ToolResult { tool_use_id: "t".into(), text: "done".into() }];
+        {
+            let mut guard = TurnGuard { chat: &chat, owed: owed.clone(), pushed: false, done: false };
+            chat.push(serde_json::json!({ "role": "user", "content": [] }));
+            chat.push(serde_json::json!({ "role": "assistant", "content": [] }));
+            guard.pushed = true;
+            guard.done = true;
+        }
+        assert_eq!(chat.snapshot().len(), 2);
+        assert!(chat.take_tool_results().is_empty());
+    }
+
     // ── The API call itself, against a local server (no live service) ────────
 
     use crate::http::tests::{reply, run, Mock, Script};
@@ -414,6 +687,20 @@ mod tests {
             let err = super::call_at(&client(2000), &mock.url("/"), "k", &body, &QUICK).await.unwrap_err();
             assert_eq!(super::chat_error(&err), "Claude API 400: model: claude-nope");
             assert_eq!(mock.hits(), 1);
+        });
+    }
+
+    #[test]
+    fn a_rejected_request_is_logged_with_the_apis_reason_and_never_the_key() {
+        run(async {
+            let body = json!({ "model": "claude-opus-5" });
+            let rejected = r#"{"type":"error","error":{"type":"invalid_request_error","message":"tool web_search is not supported with sk-live-secret-key"}}"#;
+            let mock = Mock::start(vec![reply(400, rejected)]).await;
+            let err = super::call_at(&client(2000), &mock.url("/"), "sk-live-secret-key", &body, &QUICK).await.unwrap_err();
+            let line = super::failure_line("claude-opus-5", &super::chat_error(&err));
+            assert!(line.starts_with("chat request failed (model claude-opus-5): Claude API 400: tool web_search is not supported"), "{line}");
+            assert!(!line.contains("sk-live-secret-key"), "{line}");
+            assert!(!line.contains("127.0.0.1") && !line.contains("http"), "{line}");
         });
     }
 
