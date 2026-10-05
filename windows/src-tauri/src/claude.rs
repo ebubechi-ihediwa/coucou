@@ -219,6 +219,11 @@ async fn send_turn(
     Ok(ModelReply { text, proposal })
 }
 
+/// The basic web search. The newer `web_search_20260209` filters results by running
+/// code, which the fallback model does not support, so with `"fallbacks": "default"`
+/// the API refuses the whole request before any model answers.
+const WEB_SEARCH_TOOL: &str = "web_search_20250305";
+
 /// The request for one turn: the conversation, the web search the model has always
 /// had, and the single tool through which it may ask Coucou to act.
 pub(crate) fn request_body(model: &str, messages: Vec<Value>) -> Value {
@@ -227,7 +232,7 @@ pub(crate) fn request_body(model: &str, messages: Vec<Value>) -> Value {
         "max_tokens": MAX_TOKENS,
         "system": SYSTEM_PROMPT,
         "tools": [
-            { "type": "web_search_20260209", "name": "web_search", "max_uses": 5 },
+            { "type": WEB_SEARCH_TOOL, "name": "web_search", "max_uses": 5 },
             actions::tool_definition(),
         ],
         "fallbacks": "default",
@@ -284,10 +289,25 @@ pub(crate) fn interpret(blocks: &[Value]) -> Interpreted {
 }
 
 async fn call(key: &str, body: &Value) -> Result<Value, String> {
-    let client = http::chat_client().map_err(|e| chat_error(&e))?;
+    let model = body.get("model").and_then(Value::as_str).unwrap_or("?");
+    let failed = |e: http::ApiError| {
+        let shown = chat_error(&e);
+        log::line(failure_line(model, &shown));
+        shown
+    };
+    let client = http::chat_client().map_err(failed)?;
     call_at(&client, ENDPOINT, key, body, &http::CHAT_RETRY)
         .await
-        .map_err(|e| chat_error(&e))
+        .map_err(failed)
+}
+
+/// What the log keeps of a failed request: the model and the same words the island
+/// shows. The API's own explanation (an unsupported tool, an unknown model) is what
+/// says why a request was rejected, and the island cuts it short. The text carries
+/// neither the key nor the response body: `http` removes the key from the API's
+/// message before it is kept, and `chat_error` never includes the body or the URL.
+fn failure_line(model: &str, shown: &str) -> String {
+    format!("chat request failed (model {model}): {shown}")
 }
 
 /// One message request. A message changes nothing on the server, so the
@@ -472,6 +492,10 @@ mod tests {
         let tools = body["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0]["name"], "web_search");
+        // Not the code-running variant: the fallback model rejects it (a live 400).
+        assert_eq!(tools[0]["type"], "web_search_20250305");
+        assert_eq!(body["fallbacks"], "default");
+        assert!(tools.iter().all(|t| t.get("allowed_callers").is_none()));
         assert_eq!(tools[1]["name"], crate::actions::TOOL_NAME);
         // The schema forbids anything the parser would refuse.
         assert_eq!(tools[1]["input_schema"]["additionalProperties"], false);
@@ -663,6 +687,20 @@ mod tests {
             let err = super::call_at(&client(2000), &mock.url("/"), "k", &body, &QUICK).await.unwrap_err();
             assert_eq!(super::chat_error(&err), "Claude API 400: model: claude-nope");
             assert_eq!(mock.hits(), 1);
+        });
+    }
+
+    #[test]
+    fn a_rejected_request_is_logged_with_the_apis_reason_and_never_the_key() {
+        run(async {
+            let body = json!({ "model": "claude-opus-5" });
+            let rejected = r#"{"type":"error","error":{"type":"invalid_request_error","message":"tool web_search is not supported with sk-live-secret-key"}}"#;
+            let mock = Mock::start(vec![reply(400, rejected)]).await;
+            let err = super::call_at(&client(2000), &mock.url("/"), "sk-live-secret-key", &body, &QUICK).await.unwrap_err();
+            let line = super::failure_line("claude-opus-5", &super::chat_error(&err));
+            assert!(line.starts_with("chat request failed (model claude-opus-5): Claude API 400: tool web_search is not supported"), "{line}");
+            assert!(!line.contains("sk-live-secret-key"), "{line}");
+            assert!(!line.contains("127.0.0.1") && !line.contains("http"), "{line}");
         });
     }
 
