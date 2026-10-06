@@ -159,6 +159,14 @@ pub(crate) fn parse_transcript(body: &[u8]) -> Result<String, ApiError> {
         .join(" "))
 }
 
+/// Whether the service's explanation of a 429 is about money rather than speed.
+fn mentions_credit(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    ["quota", "billing", "credit"]
+        .iter()
+        .any(|word| lower.contains(word))
+}
+
 /// What the island may say when a transcription fails: the kind of failure and what
 /// to do, never the key, the URL or the raw body.
 pub(crate) fn voice_error(err: &ApiError) -> String {
@@ -169,6 +177,15 @@ pub(crate) fn voice_error(err: &ApiError) -> String {
         }
         Status { code: 403, .. } => {
             "The speech service refused this request (403). The key may lack access.".into()
+        }
+        // OpenAI answers 429 both for "too many requests" and for "this account has no
+        // credit left" (`insufficient_quota`). The two need different things from the
+        // person, so the service's own words decide which one is said.
+        Status { code: 429, message: Some(m), .. } if mentions_credit(m) => {
+            "The speech service says this account has no credit or quota left (429). Add credit in your OpenAI billing settings.".into()
+        }
+        Status { code: 429, message: Some(m), .. } => {
+            format!("The speech service is limiting requests (429): {m}")
         }
         Status { code: 429, .. } => {
             "The speech service is rate limiting requests (429). Try again in a moment.".into()
@@ -363,6 +380,27 @@ mod tests {
                 voice_error(&err),
                 "The speech service is rate limiting requests (429). Try again in a moment."
             );
+        });
+    }
+
+    #[test]
+    fn a_429_for_lack_of_credit_is_not_called_rate_limiting() {
+        run(async {
+            // What OpenAI sends for an account with no credit.
+            let body = r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","code":"insufficient_quota"}}"#;
+            let mock = Mock::start(vec![reply(429, body)]).await;
+            let shown = voice_error(&go(&mock, &QUICK).await.unwrap_err());
+            assert_eq!(
+                shown,
+                "The speech service says this account has no credit or quota left (429). Add credit in your OpenAI billing settings."
+            );
+            assert!(!shown.contains("rate limit") && !shown.contains("sk-voice-key"));
+
+            // A genuine rate limit with words of its own keeps them; a bare one stays generic.
+            let busy = r#"{"error":{"message":"Rate limit reached for requests per minute.","type":"requests"}}"#;
+            let mock = Mock::start(vec![reply(429, busy)]).await;
+            let shown = voice_error(&go(&mock, &QUICK).await.unwrap_err());
+            assert_eq!(shown, "The speech service is limiting requests (429): Rate limit reached for requests per minute.");
         });
     }
 
