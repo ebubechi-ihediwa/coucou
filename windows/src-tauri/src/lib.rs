@@ -14,6 +14,7 @@ mod pipe;
 #[cfg(windows)]
 mod pipe_acl;
 mod platform;
+mod screen;
 mod secrets;
 mod settings;
 mod tray;
