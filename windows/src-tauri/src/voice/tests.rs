@@ -484,8 +484,19 @@ fn a_blocked_or_muted_microphone_is_told_apart_from_a_quiet_room() {
 }
 
 #[test]
-fn silence_and_taps_are_not_uploaded_and_become_i_didnt_catch_that() {
-    for samples in [vec![30i16; 16_000], vec![9000i16; 1_000], vec![]] {
+fn silence_and_taps_are_not_uploaded_and_each_says_what_to_do() {
+    // (what was recorded, whether the shortcut was let go (else the button's Done), what is said)
+    let quiet = vec![30i16; 16_000];
+    let tap = vec![9000i16; 1_000];
+    let cases = [
+        (quiet.clone(), true, COULDNT_CATCH),
+        (quiet, false, COULDNT_CATCH),
+        (tap.clone(), true, TAPPED_SHORTCUT),
+        (tap, false, TAPPED_BUTTON),
+        (vec![], true, TAPPED_SHORTCUT),
+        (vec![], false, TAPPED_BUTTON),
+    ];
+    for (samples, shortcut, said) in cases {
         let rig = Rig::new();
         rig.mic.with(|m| {
             m.stop_result = Some(Ok(Recording {
@@ -493,13 +504,17 @@ fn silence_and_taps_are_not_uploaded_and_become_i_didnt_catch_that() {
                 hit_limit: false,
             }))
         });
-        rig.voice.begin().unwrap();
+        let session = rig.voice.begin().unwrap();
         rig.next();
-        rig.voice.end();
+        if shortcut {
+            rig.voice.end_session(session);
+        } else {
+            rig.voice.end();
+        }
         assert_eq!(
             rig.next(),
             Event::Notice {
-                message: COULDNT_CATCH.into()
+                message: said.into()
             }
         );
         assert_eq!(rig.voice.phase(), Phase::Idle);
@@ -510,6 +525,14 @@ fn silence_and_taps_are_not_uploaded_and_become_i_didnt_catch_that() {
         );
         rig.quiet();
     }
+}
+
+#[test]
+fn the_tap_hints_say_what_to_do_and_are_not_the_quiet_room_message() {
+    assert!(TAPPED_SHORTCUT.contains("Hold the shortcut") && TAPPED_SHORTCUT.contains("let go"));
+    assert!(TAPPED_BUTTON.contains("Done"));
+    assert_ne!(TAPPED_SHORTCUT, COULDNT_CATCH);
+    assert_ne!(TAPPED_BUTTON, COULDNT_CATCH);
 }
 
 // ── The time and size limits ──────────────────────────────────────────────────

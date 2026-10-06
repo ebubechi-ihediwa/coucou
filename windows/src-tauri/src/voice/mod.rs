@@ -32,6 +32,10 @@ use audio::{encode_wav, judge, Heard, Recording};
 use transcribe::{Provider, Transcriber};
 
 pub const COULDNT_CATCH: &str = "I didn't catch that.";
+/// The push ended almost at once. The usual cause is pressing the shortcut like a
+/// button, so the hint says to hold it; for the microphone button, to speak first.
+pub const TAPPED_SHORTCUT: &str = "That was a tap. Hold the shortcut while you speak, then let go.";
+pub const TAPPED_BUTTON: &str = "That was too short. Speak first, then press Done.";
 pub const STILL_WORKING: &str = "Coucou is still working on your last request.";
 const BLOCKED: &str = "Microphone permission is required, or the microphone is muted. \
 Check Settings → Privacy → Microphone.";
@@ -344,7 +348,17 @@ impl Voice {
 
         let problem = match judge(&recording) {
             Heard::Speech => None,
-            Heard::TooShort | Heard::Silence => Some(Event::Notice {
+            // `session` is only given when the shortcut was let go (or the timer fired);
+            // the microphone button's second press has none.
+            Heard::TooShort => Some(Event::Notice {
+                message: if session.is_some() {
+                    TAPPED_SHORTCUT
+                } else {
+                    TAPPED_BUTTON
+                }
+                .into(),
+            }),
+            Heard::Silence => Some(Event::Notice {
                 message: COULDNT_CATCH.into(),
             }),
             Heard::Blocked => Some(Event::Error {

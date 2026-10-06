@@ -118,7 +118,7 @@ impl Transcriber for Speech {
         Box::pin(async move {
             let key = secrets::get(provider.key_name()).ok_or_else(|| provider.no_key_message())?;
             let client = client().map_err(|e| voice_error(provider, &e))?;
-            call_at(
+            let answer = call_at(
                 &client,
                 provider.endpoint(),
                 provider.model(),
@@ -126,12 +126,26 @@ impl Transcriber for Speech {
                 wav,
                 &RETRY,
             )
-            .await
-            .map_err(|e| {
-                let shown = voice_error(provider, &e);
-                log::line(format!("voice: transcription failed: {shown}"));
-                shown
-            })
+            .await;
+            // Which service answered goes in the log, and how much it said, never what.
+            match answer {
+                Ok(text) => {
+                    log::line(format!(
+                        "voice: {} transcribed {} characters",
+                        provider.label(),
+                        text.chars().count()
+                    ));
+                    Ok(text)
+                }
+                Err(e) => {
+                    let shown = voice_error(provider, &e);
+                    log::line(format!(
+                        "voice: {} transcription failed: {shown}",
+                        provider.label()
+                    ));
+                    Err(shown)
+                }
+            }
         })
     }
 }
