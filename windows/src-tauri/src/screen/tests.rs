@@ -429,10 +429,18 @@ fn the_models_the_settings_window_offers_can_all_see() {
 #[cfg(windows)]
 fn real_screen_is_captured_shrunk_and_encoded_within_the_limits() {
     let started = std::time::Instant::now();
-    let shot = SystemCapture.capture(&no_cancel()).expect("the screen can be captured");
+    let shot = SystemCapture
+        .capture(&no_cancel())
+        .expect("the screen can be captured");
     let took = started.elapsed();
     let jpeg = shot.jpeg();
-    println!("captured {}x{}, {} bytes, in {:?}", shot.width, shot.height, jpeg.len(), took);
+    println!(
+        "captured {}x{}, {} bytes, in {:?}",
+        shot.width,
+        shot.height,
+        jpeg.len(),
+        took
+    );
 
     assert!(shot.width.max(shot.height) <= LIMITS.max_long_edge);
     assert!(u64::from(shot.width) * u64::from(shot.height) <= u64::from(LIMITS.max_out_pixels));
