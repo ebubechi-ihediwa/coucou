@@ -254,6 +254,9 @@ fn approval_decline(app: AppHandle, request_id: String) {
 /// The assistant runtime, with the real launcher.
 type Assistant = assistant::Runtime<executor::SystemLauncher>;
 
+/// The screen the model may ask to see (and only when the person's request does).
+struct ScreenState(Arc<dyn screen::ScreenCapture>);
+
 /// What a chat turn gives the island: the words, and an action waiting for an answer.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -284,7 +287,10 @@ async fn chat_send(
     query: String,
     context: Option<ChatContext>,
 ) -> Result<ChatReply, String> {
-    let model = shared.settings.lock().unwrap().model.clone();
+    let (model, screen_on) = {
+        let settings = shared.settings.lock().unwrap();
+        (settings.model.clone(), settings.screen_awareness)
+    };
     let (token, superseded) = assistant
         .begin_turn()
         .map_err(|_| "Coucou is still working on your last request.".to_string())?;
@@ -298,7 +304,24 @@ async fn chat_send(
     let task = tauri::async_runtime::spawn(async move {
         let chat = task_app.state::<Chat>();
         let assistant = task_app.state::<Assistant>();
-        let reply = claude::send(&chat, &model, query, context, assistant.files()).await;
+        let screen = task_app.state::<ScreenState>().0.clone();
+        // The turn says when it is looking at the screen, and when it is back with the model.
+        let progress = |stage: claude::Stage| {
+            if assistant.set_stage(token, stage) {
+                publish(&task_app, &assistant.snapshot());
+            }
+        };
+        let reply = claude::send(
+            &chat,
+            &model,
+            query,
+            context,
+            assistant.files(),
+            screen,
+            screen_on,
+            &progress,
+        )
+        .await;
         let _ = tx.send(reply);
     });
     assistant.attach_abort(token, move || task.abort());
@@ -574,7 +597,10 @@ fn voice_config(settings: &Settings) -> voice::Config {
 /// before the microphone is touched.
 fn voice_gate(app: &AppHandle) -> Option<String> {
     use assistant::Phase;
-    if matches!(app.state::<Assistant>().snapshot().phase, Phase::Thinking | Phase::Executing) {
+    if matches!(
+        app.state::<Assistant>().snapshot().phase,
+        Phase::Thinking | Phase::Capturing | Phase::Executing
+    ) {
         return Some(voice::STILL_WORKING.to_string());
     }
     if integrations::PAUSED.load(Ordering::Relaxed) {
@@ -779,6 +805,7 @@ pub fn run() {
         })
         .manage(Pending::default())
         .manage(Chat::default())
+        .manage(ScreenState(Arc::new(screen::SystemCapture)))
         .manage(Assistant::new(
             executor::SystemLauncher,
             executor::Files::inbox(),
