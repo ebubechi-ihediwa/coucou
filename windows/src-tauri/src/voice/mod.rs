@@ -29,7 +29,7 @@ use serde::Serialize;
 use tauri::async_runtime::JoinHandle;
 
 use audio::{encode_wav, judge, Heard, Recording};
-use transcribe::Transcriber;
+use transcribe::{Provider, Transcriber};
 
 pub const COULDNT_CATCH: &str = "I didn't catch that.";
 pub const STILL_WORKING: &str = "Coucou is still working on your last request.";
@@ -151,6 +151,8 @@ pub struct Config {
     pub enabled: bool,
     pub wake_phrase_enabled: bool,
     pub wake_phrase: String,
+    /// Which speech service turns the recording into text.
+    pub provider: Provider,
     pub max_recording: Duration,
 }
 
@@ -160,8 +162,16 @@ impl Config {
             enabled,
             wake_phrase_enabled,
             wake_phrase,
+            provider: transcribe::DEFAULT_PROVIDER,
             max_recording: Duration::from_secs(u64::from(audio::MAX_RECORDING_SECS)),
         }
+    }
+}
+
+impl Config {
+    pub fn with_provider(mut self, provider: Provider) -> Config {
+        self.provider = provider;
+        self
     }
 }
 
@@ -356,8 +366,9 @@ impl Voice {
         self.sink.publish(Event::Transcribing { limit_reached });
         let this = Arc::clone(self);
         let transcriber = Arc::clone(&self.transcriber);
+        let provider = self.config.lock().unwrap().provider;
         state.request = Some(tauri::async_runtime::spawn(async move {
-            let result = transcriber.transcribe(wav).await;
+            let result = transcriber.transcribe(provider, wav).await;
             this.deliver(id, result);
         }));
     }

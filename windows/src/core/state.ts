@@ -100,6 +100,8 @@ export interface Settings {
   /** Remove a leading "Hey Coucou" from what was said. */
   wakePhraseEnabled: boolean;
   wakePhrase: string;
+  /** Which speech-to-text service the recording is sent to. */
+  speechProvider: "openai" | "groq";
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -118,6 +120,7 @@ export const DEFAULT_SETTINGS: Settings = {
   voiceShortcut: "Ctrl+Alt+Space",
   wakePhraseEnabled: true,
   wakePhrase: "Hey Coucou",
+  speechProvider: "openai",
 };
 
 /** Where a push-to-talk stands, as the island shows it. */

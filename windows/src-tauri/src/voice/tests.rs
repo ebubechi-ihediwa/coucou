@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::audio::{self, Recording, MAX_SAMPLES, SAMPLE_RATE};
-use super::transcribe::{TranscribeFuture, Transcriber};
+use super::transcribe::{Provider, TranscribeFuture, Transcriber};
 use super::*;
 
 // ── Fakes ─────────────────────────────────────────────────────────────────────
@@ -73,6 +73,7 @@ struct Speech {
     delay: Duration,
     calls: usize,
     wav_sizes: Vec<usize>,
+    providers: Vec<Provider>,
 }
 
 #[derive(Clone, Default)]
@@ -94,13 +95,14 @@ impl FakeSpeech {
 }
 
 impl Transcriber for FakeSpeech {
-    fn transcribe(&self, wav: Vec<u8>) -> TranscribeFuture<'_> {
+    fn transcribe(&self, provider: Provider, wav: Vec<u8>) -> TranscribeFuture<'_> {
         let inner = self.0.clone();
         Box::pin(async move {
             let (hang, delay, reply) = {
                 let mut s = inner.lock().unwrap();
                 s.calls += 1;
                 s.wav_sizes.push(wav.len());
+                s.providers.push(provider);
                 (
                     s.hang,
                     s.delay,
@@ -344,9 +346,41 @@ fn while_the_assistant_is_busy_a_push_is_refused_with_a_reason() {
 }
 
 #[test]
+fn the_chosen_speech_service_is_the_one_asked_and_a_change_applies_to_the_next_push() {
+    let rig = Rig::with(
+        Config::new(true, true, wake::DEFAULT_PHRASE.into()).with_provider(Provider::Groq),
+    );
+    assert_eq!(
+        rig.push(),
+        Event::Transcript {
+            text: "hello".into()
+        }
+    );
+    rig.voice.configure(
+        Config::new(true, true, wake::DEFAULT_PHRASE.into()).with_provider(Provider::OpenAi),
+    );
+    assert_eq!(
+        rig.push(),
+        Event::Transcript {
+            text: "hello".into()
+        }
+    );
+    let asked = rig.speech.0.lock().unwrap().providers.clone();
+    assert_eq!(asked, vec![Provider::Groq, Provider::OpenAi]);
+}
+
+#[test]
+fn the_default_speech_service_is_openai() {
+    assert_eq!(
+        Config::new(true, true, "x".into()).provider,
+        Provider::OpenAi
+    );
+}
+
+#[test]
 fn without_a_speech_key_the_microphone_is_never_opened_and_the_person_is_told() {
     let rig = Rig::new();
-    *rig.gate.lock().unwrap() = Some(super::transcribe::NO_KEY.into());
+    *rig.gate.lock().unwrap() = Some(Provider::OpenAi.no_key_message());
     assert_eq!(rig.voice.begin(), Err(Refused::Blocked));
     assert_eq!(
         rig.next(),

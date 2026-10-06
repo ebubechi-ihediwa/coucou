@@ -430,6 +430,13 @@ function keyName(code: string): string | null {
   return null;
 }
 
+/** The speech services a recording can be sent to: their names, Credential Manager entries, and what a key looks like. */
+const SPEECH_SERVICES: Record<string, { label: string; key: string; placeholder: string }> = {
+  openai: { label: "OpenAI", key: "openai-api-key", placeholder: "sk-…" },
+  groq: { label: "Groq", key: "groq-api-key", placeholder: "gsk_…" },
+};
+const speechService = () => SPEECH_SERVICES[settings.speechProvider] ?? SPEECH_SERVICES.openai;
+
 function voiceSection(hasKey: boolean): HTMLElement {
   const dot = statusDot(false);
   const status = h("span", { class: "hint" });
@@ -498,38 +505,64 @@ function voiceSection(hasKey: boolean): HTMLElement {
     }
   });
 
-  // ── The speech-to-text key
+  // ── The speech service and its key
+  const service = h("select", {}) as HTMLSelectElement;
+  for (const [id, def] of Object.entries(SPEECH_SERVICES)) {
+    service.append(h("option", { value: id, text: def.label }));
+  }
+  service.value = settings.speechProvider;
+
+  const keyLabel = h("label", {});
   const field = h("input", {
     type: "password",
-    placeholder: hasKey ? "••••••••••••  (stored)" : "sk-…",
     style: "flex:1 1 auto;min-width:0",
     autocomplete: "off",
     spellcheck: "false",
   }) as HTMLInputElement;
   const saveBtn = h("button", { class: "primary", text: "Save key" });
   const clearBtn = h("button", { class: "danger", text: "Remove" });
-  clearBtn.style.display = hasKey ? "" : "none";
+  const audioNote = h("div", { class: "hint" });
+  let keyPresent = hasKey;
+
+  /** What depends on the chosen service: names, placeholder, the note about where audio goes. */
+  function labels() {
+    const def = speechService();
+    keyLabel.textContent = `${def.label} key`;
+    field.placeholder = keyPresent ? "••••••••••••  (stored)" : def.placeholder;
+    clearBtn.style.display = keyPresent ? "" : "none";
+    audioNote.textContent = `Audio is recorded only while you hold the shortcut (45 seconds at most), sent to ${def.label} to be turned into text, and never saved.`;
+  }
 
   async function refresh() {
     const s = await Bridge.voiceState();
     if (!s) return;
+    keyPresent = s.hasKey;
     dot.style.background = s.supported && s.enabled && s.shortcutState === "ready" && s.hasKey ? "#22c55e" : "#f4505e";
     if (!s.supported) status.textContent = "Push-to-talk isn't available on this system yet.";
     else if (!s.enabled) status.textContent = "Voice is off. The shortcut is not registered and the microphone is never used.";
     else if (s.shortcutState === "failed") status.textContent = `${s.problem ?? "The shortcut could not be registered."} (${s.shortcut})`;
-    else if (!s.hasKey) status.textContent = `Hold ${s.shortcut} to talk once a speech-to-text key is saved below.`;
+    else if (!s.hasKey) status.textContent = `Hold ${s.shortcut} to talk once a ${s.providerLabel} key is saved below.`;
     else status.textContent = `Hold ${s.shortcut} anywhere to talk. Let go to send.`;
-    keyState.textContent = s.hasKey ? "Key saved in the Windows Credential Manager." : "No key yet: voice needs one.";
-    field.placeholder = s.hasKey ? "••••••••••••  (stored)" : "sk-…";
-    clearBtn.style.display = s.hasKey ? "" : "none";
+    keyState.textContent = s.hasKey
+      ? "Key saved in the Windows Credential Manager."
+      : `No ${s.providerLabel} key yet: voice needs one.`;
+    labels();
   }
+
+  service.addEventListener("change", async () => {
+    clear(feedback);
+    settings.speechProvider = service.value as Settings["speechProvider"];
+    field.value = "";
+    await save();
+    await refresh();
+  });
 
   saveBtn.addEventListener("click", async () => {
     const value = field.value.trim();
     if (!value) return;
     clear(feedback);
     try {
-      await Bridge.secretSet("openai-api-key", value);
+      await Bridge.secretSet(speechService().key, value);
       field.value = "";
       feedback.append(h("div", { class: "notice ok", text: "Saved. It never touches disk." }));
       await refresh();
@@ -540,7 +573,7 @@ function voiceSection(hasKey: boolean): HTMLElement {
   clearBtn.addEventListener("click", async () => {
     clear(feedback);
     try {
-      await Bridge.secretClear("openai-api-key");
+      await Bridge.secretClear(speechService().key);
       feedback.append(h("div", { class: "notice ok", text: "Key removed." }));
       await refresh();
     } catch (err) {
@@ -548,6 +581,7 @@ function voiceSection(hasKey: boolean): HTMLElement {
     }
   });
 
+  labels();
   void onEvent("voice-status", () => void refresh());
   void refresh();
 
@@ -570,10 +604,11 @@ function voiceSection(hasKey: boolean): HTMLElement {
       phrase,
     ),
     h("div", { class: "hint", text: "If a request starts with this phrase it is removed. It is not listened for: the microphone only opens while you hold the shortcut." }),
-    h("div", { class: "row" }, h("label", { text: "OpenAI key" }), field, saveBtn, clearBtn),
+    h("div", { class: "row" }, h("label", { text: "Speech service" }), service),
+    h("div", { class: "row" }, keyLabel, field, saveBtn, clearBtn),
     keyState,
     feedback,
-    h("div", { class: "hint", text: "Audio is recorded only while you hold the shortcut (45 seconds at most), sent to OpenAI to be turned into text, and never saved." }),
+    audioNote,
   );
 }
 
@@ -590,7 +625,7 @@ async function main() {
   };
 
   const hasKey = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
-  const hasVoiceKey = (await Bridge.secretPresent("openai-api-key")) ?? false;
+  const hasVoiceKey = (await Bridge.secretPresent(speechService().key)) ?? false;
 
   const keys = [
     "stripe-api-key", "github-token", "vercel-token",

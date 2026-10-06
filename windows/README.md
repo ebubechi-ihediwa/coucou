@@ -197,9 +197,9 @@ policy and the **Allow / Deny** card judge a spoken request exactly like a typed
 - **Bounded.** A push lasts 45 seconds at most (`audio::MAX_RECORDING_SECS`), and the
   recording buffer itself stops growing at the same size, so a stuck key cannot make
   an unbounded recording.
-- **Private.** The audio is held in memory only, sent to OpenAI's transcription
-  endpoint with your own key (saved in the Windows Credential Manager under
-  **Settings… → Voice**), and discarded. It is never written to disk. Silence, a tap
+- **Private.** The audio is held in memory only, sent to the speech service you pick
+  in **Settings… → Voice** (OpenAI or Groq) with your own key for it (saved in the
+  Windows Credential Manager), and discarded. It is never written to disk. Silence, a tap
   and a muted or blocked microphone are recognised on your computer and not uploaded.
   What you said is not written to the log.
 - **Windows only for now.** Linux says so instead of pretending.

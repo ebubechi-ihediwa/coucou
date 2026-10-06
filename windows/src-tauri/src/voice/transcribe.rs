@@ -1,7 +1,11 @@
 // Speech to text: one recording in, one piece of text out.
 //
-// Anthropic has no speech-to-text, so this talks to OpenAI's transcription endpoint
-// with its own key (`openai-api-key`, in the Credential Manager like every other).
+// Anthropic has no speech-to-text, so this talks to a second service, chosen in
+// Settings: OpenAI or Groq. Both take the same request (an OpenAI-style multipart
+// upload) and answer the same JSON, so a provider is only an address, a model and the
+// name of its key in the Credential Manager. It is a closed choice of two, not a
+// framework.
+//
 // It goes through the shared HTTP layer: bounded body, bounded time, bounded retries,
 // error text that never carries the key, the URL or the response body.
 //
@@ -20,10 +24,66 @@ use serde_json::Value;
 use crate::http::{self, ApiError, Retry};
 use crate::{log, secrets};
 
-pub const ENDPOINT: &str = "https://api.openai.com/v1/audio/transcriptions";
-/// The model the request names. The only place it is written down.
-pub const MODEL: &str = "gpt-4o-mini-transcribe";
-pub const KEY_NAME: &str = "openai-api-key";
+/// The speech services push-to-talk can use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Provider {
+    OpenAi,
+    Groq,
+}
+
+pub const DEFAULT_PROVIDER: Provider = Provider::OpenAi;
+
+impl Provider {
+    /// The id written in settings.
+    pub fn id(self) -> &'static str {
+        match self {
+            Provider::OpenAi => "openai",
+            Provider::Groq => "groq",
+        }
+    }
+
+    /// Exactly an id from `id`; anything else is not a provider.
+    pub fn from_id(id: &str) -> Option<Provider> {
+        [Provider::OpenAi, Provider::Groq]
+            .into_iter()
+            .find(|p| p.id() == id)
+    }
+
+    /// What the person calls it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Provider::OpenAi => "OpenAI",
+            Provider::Groq => "Groq",
+        }
+    }
+
+    pub fn endpoint(self) -> &'static str {
+        match self {
+            Provider::OpenAi => "https://api.openai.com/v1/audio/transcriptions",
+            Provider::Groq => "https://api.groq.com/openai/v1/audio/transcriptions",
+        }
+    }
+
+    /// The model the request names. The only place each is written down.
+    pub fn model(self) -> &'static str {
+        match self {
+            Provider::OpenAi => "gpt-4o-mini-transcribe",
+            Provider::Groq => "whisper-large-v3-turbo",
+        }
+    }
+
+    /// The Credential Manager entry holding this provider's key (see `secrets`).
+    pub fn key_name(self) -> &'static str {
+        match self {
+            Provider::OpenAi => "openai-api-key",
+            Provider::Groq => "groq-api-key",
+        }
+    }
+
+    pub fn no_key_message(self) -> String {
+        format!("Add your {} key in Settings to use voice.", self.label())
+    }
+}
 
 /// Up to 45 s of audio goes up, and a short text comes back.
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -42,30 +102,36 @@ pub const RETRY: Retry = Retry {
     attempt_timeout: TIMEOUT,
 };
 
-pub const NO_KEY: &str = "Add your OpenAI key in Settings to use voice.";
-
 pub type TranscribeFuture<'a> = Pin<Box<dyn Future<Output = Result<String, String>> + Send + 'a>>;
 
 /// The one thing the rest of the app needs from a speech service. `Err` is a
 /// sentence fit to show.
 pub trait Transcriber: Send + Sync + 'static {
-    fn transcribe(&self, wav: Vec<u8>) -> TranscribeFuture<'_>;
+    fn transcribe(&self, provider: Provider, wav: Vec<u8>) -> TranscribeFuture<'_>;
 }
 
-pub struct OpenAi;
+/// The real services, over the network.
+pub struct Speech;
 
-impl Transcriber for OpenAi {
-    fn transcribe(&self, wav: Vec<u8>) -> TranscribeFuture<'_> {
+impl Transcriber for Speech {
+    fn transcribe(&self, provider: Provider, wav: Vec<u8>) -> TranscribeFuture<'_> {
         Box::pin(async move {
-            let key = secrets::get(KEY_NAME).ok_or_else(|| NO_KEY.to_string())?;
-            let client = client().map_err(|e| voice_error(&e))?;
-            call_at(&client, ENDPOINT, &key, wav, &RETRY)
-                .await
-                .map_err(|e| {
-                    let shown = voice_error(&e);
-                    log::line(format!("voice: transcription failed: {shown}"));
-                    shown
-                })
+            let key = secrets::get(provider.key_name()).ok_or_else(|| provider.no_key_message())?;
+            let client = client().map_err(|e| voice_error(provider, &e))?;
+            call_at(
+                &client,
+                provider.endpoint(),
+                provider.model(),
+                &key,
+                wav,
+                &RETRY,
+            )
+            .await
+            .map_err(|e| {
+                let shown = voice_error(provider, &e);
+                log::line(format!("voice: transcription failed: {shown}"));
+                shown
+            })
         })
     }
 }
@@ -80,6 +146,7 @@ fn client() -> Result<Client, ApiError> {
 pub(crate) async fn call_at(
     client: &Client,
     endpoint: &str,
+    model: &str,
     key: &str,
     wav: Vec<u8>,
     retry: &Retry,
@@ -87,7 +154,7 @@ pub(crate) async fn call_at(
     let auth = http::bearer(key)?;
     let boundary = boundary_for(&wav);
     let content_type = format!("multipart/form-data; boundary={boundary}");
-    let body = multipart_body(&boundary, &wav);
+    let body = multipart_body(&boundary, model, &wav);
     drop(wav);
     let bytes = http::send_retrying(
         || {
@@ -119,9 +186,9 @@ fn boundary_for(wav: &[u8]) -> String {
 }
 
 /// `multipart/form-data` by hand: three small parts, no extra crate.
-pub(crate) fn multipart_body(boundary: &str, wav: &[u8]) -> Vec<u8> {
+pub(crate) fn multipart_body(boundary: &str, model: &str, wav: &[u8]) -> Vec<u8> {
     let mut body = Vec::with_capacity(wav.len() + 512);
-    for (name, value) in [("model", MODEL), ("response_format", "json")] {
+    for (name, value) in [("model", model), ("response_format", "json")] {
         body.extend_from_slice(
             format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes(),
         );
@@ -169,29 +236,30 @@ fn mentions_credit(message: &str) -> bool {
 
 /// What the island may say when a transcription fails: the kind of failure and what
 /// to do, never the key, the URL or the raw body.
-pub(crate) fn voice_error(err: &ApiError) -> String {
+pub(crate) fn voice_error(provider: Provider, err: &ApiError) -> String {
     use ApiError::*;
+    let service = provider.label();
     match err {
         Status { code: 401, .. } => {
-            "The speech-to-text key was rejected (401). Check it in Settings.".into()
+            format!("The {service} key was rejected (401). Check it in Settings.")
         }
         Status { code: 403, .. } => {
-            "The speech service refused this request (403). The key may lack access.".into()
+            format!("{service} refused this request (403). The key may lack access.")
         }
-        // OpenAI answers 429 both for "too many requests" and for "this account has no
-        // credit left" (`insufficient_quota`). The two need different things from the
+        // A 429 can mean "too many requests" or "this account has no credit left"
+        // (OpenAI's `insufficient_quota`). The two need different things from the
         // person, so the service's own words decide which one is said.
-        Status { code: 429, message: Some(m), .. } if mentions_credit(m) => {
-            "The speech service says this account has no credit or quota left (429). Add credit in your OpenAI billing settings.".into()
-        }
+        Status { code: 429, message: Some(m), .. } if mentions_credit(m) => format!(
+            "{service} says this account has no credit or quota left (429). Check your {service} billing settings."
+        ),
         Status { code: 429, message: Some(m), .. } => {
-            format!("The speech service is limiting requests (429): {m}")
+            format!("{service} is limiting requests (429): {m}")
         }
         Status { code: 429, .. } => {
-            "The speech service is rate limiting requests (429). Try again in a moment.".into()
+            format!("{service} is rate limiting requests (429). Try again in a moment.")
         }
         Status { code, .. } if *code >= 500 => {
-            format!("The speech service is unavailable ({code}). Try again in a moment.")
+            format!("{service} is unavailable ({code}). Try again in a moment.")
         }
         Status {
             code,
@@ -201,7 +269,7 @@ pub(crate) fn voice_error(err: &ApiError) -> String {
         Status { code, .. } => format!("I couldn't transcribe that ({code})."),
         Timeout => "Transcription took too long. Try again.".into(),
         Connect | Transport => "I couldn't transcribe that. Check your connection.".into(),
-        TooLarge | Malformed => "The speech service sent a reply I couldn't read.".into(),
+        TooLarge | Malformed => format!("{service} sent a reply I couldn't read."),
     }
 }
 
@@ -231,6 +299,7 @@ mod tests {
         call_at(
             &client(2000),
             &mock.url("/v1/audio/transcriptions"),
+            Provider::OpenAi.model(),
             "sk-voice-key",
             wav(),
             retry,
@@ -261,7 +330,7 @@ mod tests {
     #[test]
     fn the_form_names_the_model_and_holds_the_wav_untouched() {
         let wav = wav();
-        let body = multipart_body("BOUND", &wav);
+        let body = multipart_body("BOUND", Provider::OpenAi.model(), &wav);
         let text = String::from_utf8_lossy(&body);
         assert!(text.starts_with("--BOUND\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-4o-mini-transcribe\r\n"));
         assert!(text.contains("name=\"response_format\"\r\n\r\njson\r\n"));
@@ -327,10 +396,10 @@ mod tests {
             let body = r#"{"error":{"message":"Incorrect API key provided: sk-voice-key","type":"invalid_request_error"}}"#;
             let mock = Mock::start(vec![reply(401, body)]).await;
             let err = go(&mock, &QUICK).await.unwrap_err();
-            let shown = voice_error(&err);
+            let shown = voice_error(Provider::OpenAi, &err);
             assert_eq!(
                 shown,
-                "The speech-to-text key was rejected (401). Check it in Settings."
+                "The OpenAI key was rejected (401). Check it in Settings."
             );
             assert!(!shown.contains("sk-voice-key"));
             assert_eq!(mock.hits(), 1, "a bad key is not retried");
@@ -342,7 +411,7 @@ mod tests {
         run(async {
             let body = r#"{"error":{"message":"bad request for sk-voice-key"}}"#;
             let mock = Mock::start(vec![reply(400, body)]).await;
-            let shown = voice_error(&go(&mock, &QUICK).await.unwrap_err());
+            let shown = voice_error(Provider::OpenAi, &go(&mock, &QUICK).await.unwrap_err());
             assert_eq!(
                 shown,
                 "I couldn't transcribe that (400): bad request for [redacted]"
@@ -359,8 +428,8 @@ mod tests {
                 let err = go(&mock, &QUICK).await.unwrap_err();
                 assert_eq!(err, ApiError::Malformed, "{body}");
                 assert_eq!(
-                    voice_error(&err),
-                    "The speech service sent a reply I couldn't read."
+                    voice_error(Provider::OpenAi, &err),
+                    "OpenAI sent a reply I couldn't read."
                 );
             }
         });
@@ -377,8 +446,8 @@ mod tests {
             let err = go(&mock, &QUICK).await.unwrap_err();
             assert_eq!(mock.hits(), 2, "one try and one retry, no more");
             assert_eq!(
-                voice_error(&err),
-                "The speech service is rate limiting requests (429). Try again in a moment."
+                voice_error(Provider::OpenAi, &err),
+                "OpenAI is rate limiting requests (429). Try again in a moment."
             );
         });
     }
@@ -389,19 +458,148 @@ mod tests {
             // What OpenAI sends for an account with no credit.
             let body = r#"{"error":{"message":"You exceeded your current quota, please check your plan and billing details.","type":"insufficient_quota","code":"insufficient_quota"}}"#;
             let mock = Mock::start(vec![reply(429, body)]).await;
-            let shown = voice_error(&go(&mock, &QUICK).await.unwrap_err());
+            let shown = voice_error(Provider::OpenAi, &go(&mock, &QUICK).await.unwrap_err());
             assert_eq!(
                 shown,
-                "The speech service says this account has no credit or quota left (429). Add credit in your OpenAI billing settings."
+                "OpenAI says this account has no credit or quota left (429). Check your OpenAI billing settings."
             );
             assert!(!shown.contains("rate limit") && !shown.contains("sk-voice-key"));
 
             // A genuine rate limit with words of its own keeps them; a bare one stays generic.
             let busy = r#"{"error":{"message":"Rate limit reached for requests per minute.","type":"requests"}}"#;
             let mock = Mock::start(vec![reply(429, busy)]).await;
-            let shown = voice_error(&go(&mock, &QUICK).await.unwrap_err());
-            assert_eq!(shown, "The speech service is limiting requests (429): Rate limit reached for requests per minute.");
+            let shown = voice_error(Provider::OpenAi, &go(&mock, &QUICK).await.unwrap_err());
+            assert_eq!(
+                shown,
+                "OpenAI is limiting requests (429): Rate limit reached for requests per minute."
+            );
         });
+    }
+
+    #[test]
+    fn each_provider_has_its_own_address_model_and_key() {
+        use Provider::*;
+        assert_eq!(
+            OpenAi.endpoint(),
+            "https://api.openai.com/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            Groq.endpoint(),
+            "https://api.groq.com/openai/v1/audio/transcriptions"
+        );
+        assert_eq!(
+            (OpenAi.model(), Groq.model()),
+            ("gpt-4o-mini-transcribe", "whisper-large-v3-turbo")
+        );
+        assert_eq!(
+            (OpenAi.key_name(), Groq.key_name()),
+            ("openai-api-key", "groq-api-key")
+        );
+        for p in [OpenAi, Groq] {
+            assert!(
+                p.endpoint().starts_with("https://"),
+                "audio only ever goes over https"
+            );
+            assert_eq!(Provider::from_id(p.id()), Some(p));
+            assert!(
+                crate::secrets::KNOWN_KEYS.contains(&p.key_name()),
+                "its key can be stored"
+            );
+        }
+        // Exactly the ids settings writes; nothing near-miss is a provider.
+        for bad in [
+            "",
+            "OpenAI",
+            "GROQ",
+            "openai ",
+            "anthropic",
+            "https://evil.example",
+        ] {
+            assert_eq!(Provider::from_id(bad), None, "{bad:?}");
+        }
+        assert_eq!(
+            Groq.no_key_message(),
+            "Add your Groq key in Settings to use voice."
+        );
+        assert_eq!(DEFAULT_PROVIDER, OpenAi);
+    }
+
+    #[test]
+    fn a_groq_request_names_its_model_and_sends_its_own_key() {
+        run(async {
+            let mock =
+                Mock::start(vec![reply(200, r#"{"text":"Hey Coucou, open Notepad."}"#)]).await;
+            let text = call_at(
+                &client(2000),
+                &mock.url("/openai/v1/audio/transcriptions"),
+                Provider::Groq.model(),
+                "gsk-groq-key",
+                wav(),
+                &QUICK,
+            )
+            .await
+            .unwrap();
+            assert_eq!(text, "Hey Coucou, open Notepad.");
+            let seen = mock.seen_headers(0);
+            assert_eq!(
+                seen.get("authorization").map(String::as_str),
+                Some("Bearer gsk-groq-key")
+            );
+        });
+        let form = String::from_utf8_lossy(&multipart_body("B", Provider::Groq.model(), &wav()))
+            .to_string();
+        assert!(form.contains("name=\"model\"\r\n\r\nwhisper-large-v3-turbo\r\n"));
+        assert!(
+            !form.contains("gpt-4o"),
+            "the other provider's model is nowhere in it"
+        );
+        assert!(form.contains("name=\"response_format\"\r\n\r\njson\r\n"));
+    }
+
+    #[test]
+    fn errors_name_the_service_that_was_used() {
+        let status = |code, message: Option<&str>| ApiError::Status {
+            code,
+            message: message.map(String::from),
+            retry_after: None,
+        };
+        assert_eq!(
+            voice_error(Provider::Groq, &status(401, None)),
+            "The Groq key was rejected (401). Check it in Settings."
+        );
+        assert_eq!(
+            voice_error(
+                Provider::Groq,
+                &status(
+                    429,
+                    Some("Rate limit reached for model whisper-large-v3-turbo")
+                )
+            ),
+            "Groq is limiting requests (429): Rate limit reached for model whisper-large-v3-turbo"
+        );
+        assert_eq!(
+            voice_error(Provider::Groq, &status(429, Some("Your account has no credits left"))),
+            "Groq says this account has no credit or quota left (429). Check your Groq billing settings."
+        );
+        assert_eq!(
+            voice_error(Provider::Groq, &status(503, None)),
+            "Groq is unavailable (503). Try again in a moment."
+        );
+        assert_eq!(
+            voice_error(Provider::Groq, &ApiError::Malformed),
+            "Groq sent a reply I couldn't read."
+        );
+        // And never the other one's name.
+        for err in [
+            status(401, None),
+            status(403, None),
+            status(429, None),
+            status(500, None),
+            ApiError::Malformed,
+        ] {
+            assert!(!voice_error(Provider::Groq, &err).contains("OpenAI"));
+            assert!(!voice_error(Provider::OpenAi, &err).contains("Groq"));
+        }
     }
 
     #[test]
@@ -412,11 +610,8 @@ mod tests {
                 r#"{"error":{"message":"internal detail"}}"#,
             )])
             .await;
-            let shown = voice_error(&go(&mock, &QUICK).await.unwrap_err());
-            assert_eq!(
-                shown,
-                "The speech service is unavailable (503). Try again in a moment."
-            );
+            let shown = voice_error(Provider::OpenAi, &go(&mock, &QUICK).await.unwrap_err());
+            assert_eq!(shown, "OpenAI is unavailable (503). Try again in a moment.");
             assert!(!shown.contains("internal detail"));
         });
     }
@@ -429,12 +624,22 @@ mod tests {
                 attempt_timeout: Duration::from_millis(200),
                 ..QUICK
             };
-            let err = call_at(&client(200), &mock.url("/"), "k", wav(), &quick)
-                .await
-                .unwrap_err();
+            let err = call_at(
+                &client(200),
+                &mock.url("/"),
+                Provider::OpenAi.model(),
+                "k",
+                wav(),
+                &quick,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(err, ApiError::Timeout);
             assert_eq!(mock.hits(), 1);
-            assert_eq!(voice_error(&err), "Transcription took too long. Try again.");
+            assert_eq!(
+                voice_error(Provider::OpenAi, &err),
+                "Transcription took too long. Try again."
+            );
         });
     }
 
@@ -444,6 +649,7 @@ mod tests {
             let err = call_at(
                 &client(5000),
                 "http://coucou-test.invalid/",
+                Provider::OpenAi.model(),
                 "k",
                 wav(),
                 &QUICK,
@@ -451,7 +657,7 @@ mod tests {
             .await
             .unwrap_err();
             assert_eq!(
-                voice_error(&err),
+                voice_error(Provider::OpenAi, &err),
                 "I couldn't transcribe that. Check your connection."
             );
         });
@@ -471,10 +677,17 @@ mod tests {
         run(async {
             let mock = Mock::start(vec![Script::Hang]).await;
             let url = mock.url("/");
-            let task =
-                tokio::spawn(
-                    async move { call_at(&client(30_000), &url, "k", wav(), &QUICK).await },
-                );
+            let task = tokio::spawn(async move {
+                call_at(
+                    &client(30_000),
+                    &url,
+                    Provider::OpenAi.model(),
+                    "k",
+                    wav(),
+                    &QUICK,
+                )
+                .await
+            });
             tokio::time::sleep(Duration::from_millis(100)).await;
             task.abort();
             assert!(task.await.unwrap_err().is_cancelled());
@@ -485,12 +698,19 @@ mod tests {
     fn a_key_with_a_stray_newline_is_a_bad_key_not_a_network_error() {
         run(async {
             let mock = Mock::start(vec![reply(200, "{}")]).await;
-            let err = call_at(&client(2000), &mock.url("/"), "sk-bad\nkey", wav(), &QUICK)
-                .await
-                .unwrap_err();
+            let err = call_at(
+                &client(2000),
+                &mock.url("/"),
+                Provider::OpenAi.model(),
+                "sk-bad\nkey",
+                wav(),
+                &QUICK,
+            )
+            .await
+            .unwrap_err();
             assert_eq!(
-                voice_error(&err),
-                "The speech-to-text key was rejected (401). Check it in Settings."
+                voice_error(Provider::OpenAi, &err),
+                "The OpenAI key was rejected (401). Check it in Settings."
             );
             assert_eq!(
                 mock.hits(),
@@ -519,7 +739,7 @@ mod tests {
         ];
         let mut seen = std::collections::HashSet::new();
         for err in cases {
-            let shown = voice_error(&err);
+            let shown = voice_error(Provider::OpenAi, &err);
             assert!(
                 !shown.contains("http") && !shown.contains("/v1/"),
                 "{shown}"

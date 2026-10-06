@@ -70,6 +70,9 @@ pub struct Settings {
     pub wake_phrase_enabled: bool,
     #[serde(default = "default_wake_phrase")]
     pub wake_phrase: String,
+    /// The speech-to-text service behind push-to-talk: "openai" or "groq".
+    #[serde(default = "default_speech_provider")]
+    pub speech_provider: String,
 }
 
 fn default_model() -> String {
@@ -86,6 +89,10 @@ fn default_voice_shortcut() -> String {
 
 fn default_wake_phrase() -> String {
     crate::voice::wake::DEFAULT_PHRASE.to_string()
+}
+
+fn default_speech_provider() -> String {
+    crate::voice::transcribe::DEFAULT_PROVIDER.id().to_string()
 }
 
 impl Default for Settings {
@@ -109,6 +116,7 @@ impl Default for Settings {
             voice_shortcut: default_voice_shortcut(),
             wake_phrase_enabled: true,
             wake_phrase: default_wake_phrase(),
+            speech_provider: default_speech_provider(),
         }
     }
 }
@@ -187,6 +195,13 @@ fn sanitize(s: &mut Settings) -> Vec<&'static str> {
     } else if phrase != s.wake_phrase {
         s.wake_phrase = phrase;
         changed.push("wakePhrase");
+    }
+
+    // The provider decides where the person's voice is sent: only one of the two the
+    // app knows, exactly spelled.
+    if crate::voice::transcribe::Provider::from_id(&s.speech_provider).is_none() {
+        s.speech_provider = d.speech_provider;
+        changed.push("speechProvider");
     }
 
     // The ids decide which services get polled over the network: only well-formed,
@@ -409,6 +424,9 @@ fn migrate_1_to_2(object: &mut Map<String, Value>) {
     object
         .entry("wakePhrase")
         .or_insert_with(|| default_wake_phrase().into());
+    object
+        .entry("speechProvider")
+        .or_insert_with(|| default_speech_provider().into());
 }
 
 /// Reads each field on its own, so a wrong type costs that field and no other.
@@ -487,6 +505,13 @@ fn from_object(object: &Map<String, Value>, notes: &mut Vec<String>) -> Settings
             notes,
             |v| v.as_str().map(String::from),
             d.wake_phrase,
+        ),
+        speech_provider: field(
+            object,
+            "speechProvider",
+            notes,
+            |v| v.as_str().map(String::from),
+            d.speech_provider,
         ),
     };
     for name in sanitize(&mut s) {
@@ -717,6 +742,7 @@ mod tests {
             voice_shortcut: default_voice_shortcut(),
             wake_phrase_enabled: true,
             wake_phrase: default_wake_phrase(),
+            speech_provider: default_speech_provider(),
         }
     }
 
@@ -1191,6 +1217,7 @@ mod tests {
         assert_eq!(rewritten["voiceShortcut"], "Ctrl+Alt+Space");
         assert_eq!(rewritten["wakePhraseEnabled"], true);
         assert_eq!(rewritten["wakePhrase"], "Hey Coucou");
+        assert_eq!(rewritten["speechProvider"], "openai");
         assert_eq!(rewritten["model"], "claude-sonnet-5");
         assert_eq!(std::fs::read_to_string(dir.0.join("settings.json.v1.bak")).unwrap(), V1_BEFORE_VOICE);
         // And starting again changes nothing.
@@ -1216,6 +1243,7 @@ mod tests {
             voice_shortcut: "Ctrl+Shift+K".into(),
             wake_phrase_enabled: false,
             wake_phrase: "OK Mochi".into(),
+            speech_provider: "groq".into(),
             ..custom()
         }
     }
@@ -1232,6 +1260,46 @@ mod tests {
         assert_eq!(on_disk["voiceShortcut"], "Ctrl+Shift+K");
         assert_eq!(on_disk["wakePhraseEnabled"], false);
         assert_eq!(on_disk["wakePhrase"], "OK Mochi");
+        assert_eq!(on_disk["speechProvider"], "groq");
+    }
+
+    #[test]
+    fn only_a_speech_provider_the_app_knows_is_kept() {
+        for bad in ["", "OpenAI", "GROQ", "anthropic", "groq ", "https://x.example"] {
+            let mut s = Settings { speech_provider: bad.into(), ..Settings::default() };
+            assert_eq!(sanitize(&mut s), vec!["speechProvider"], "{bad:?}");
+            assert_eq!(s.speech_provider, "openai", "{bad:?}");
+        }
+        for good in ["openai", "groq"] {
+            let mut s = Settings { speech_provider: good.into(), ..Settings::default() };
+            assert!(sanitize(&mut s).is_empty(), "{good}");
+        }
+    }
+
+    #[test]
+    fn a_version_2_file_from_before_groq_gets_the_default_without_a_fuss() {
+        let dir = Dir::new("v2-before-groq");
+        dir.put(r#"{ "version": 2, "voiceEnabled": false, "wakePhrase": "OK Mochi" }"#);
+        let loaded = load_from(&dir.0);
+        assert_eq!(loaded.settings.speech_provider, "openai");
+        assert!(!loaded.settings.voice_enabled);
+        assert_eq!(loaded.settings.wake_phrase, "OK Mochi");
+        assert!(loaded.notes.is_empty(), "{:?}", loaded.notes);
+        assert_eq!(dir.names(), vec![FILE.to_string()], "nothing is rewritten or backed up");
+    }
+
+    #[test]
+    fn a_wrong_typed_or_unknown_speech_provider_in_a_file_costs_only_itself() {
+        let dir = Dir::new("bad-provider");
+        dir.put(r#"{ "version": 2, "soundEnabled": false, "speechProvider": 7 }"#);
+        let s = load_from(&dir.0).settings;
+        assert_eq!(s.speech_provider, "openai");
+        assert!(!s.sound_enabled);
+        let dir = Dir::new("unknown-provider");
+        dir.put(r#"{ "version": 2, "soundEnabled": false, "speechProvider": "somewhere-else" }"#);
+        let loaded = load_from(&dir.0);
+        assert_eq!(loaded.settings.speech_provider, "openai");
+        assert!(loaded.notes.iter().any(|n| n.contains("speechProvider")), "{:?}", loaded.notes);
     }
 
     #[test]

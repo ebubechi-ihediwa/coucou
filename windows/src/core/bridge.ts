@@ -135,6 +135,9 @@ export interface VoiceStatus {
   supported: boolean;
   enabled: boolean;
   shortcut: string;
+  /** The chosen speech service: its id and what to call it. */
+  provider: "openai" | "groq";
+  providerLabel: string;
   shortcutState: "off" | "ready" | "failed";
   /** Why the shortcut could not be registered. */
   problem: string | null;

@@ -10,6 +10,7 @@ pub const KNOWN_KEYS: &[&str] = &[
     "anthropic-api-key",
     // The speech-to-text service behind push-to-talk (see voice::transcribe).
     "openai-api-key",
+    "groq-api-key",
     "n8n-url",
     "n8n-api-key",
     "vercel-token",

@@ -78,7 +78,8 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
             current.voice_enabled != settings.voice_enabled || current.voice_shortcut != settings.voice_shortcut;
         let voice_changed = shortcut_changed
             || current.wake_phrase_enabled != settings.wake_phrase_enabled
-            || current.wake_phrase != settings.wake_phrase;
+            || current.wake_phrase != settings.wake_phrase
+            || current.speech_provider != settings.speech_provider;
         *current = settings.clone();
         (screen_changed, autostart_changed, shortcut_changed, voice_changed)
     };
@@ -484,7 +485,10 @@ pub struct VoiceStatus {
     shortcut_state: &'static str,
     /// Why the shortcut could not be registered.
     problem: Option<String>,
-    /// Whether the speech-to-text key is saved (never its value).
+    /// Which speech service is chosen ("openai" or "groq") and what to call it.
+    provider: &'static str,
+    provider_label: &'static str,
+    /// Whether that service's key is saved (never its value).
     has_key: bool,
     phase: voice::Phase,
 }
@@ -517,7 +521,7 @@ impl VoiceHub {
         let gate_app = app.clone();
         let voice = voice::Voice::new(
             Box::new(platform::voice::Microphone::default()),
-            Arc::new(voice::transcribe::OpenAi),
+            Arc::new(voice::transcribe::Speech),
             Arc::new(IslandSink { app: app.clone() }),
             Box::new(move || voice_gate(&gate_app)),
             voice_config(settings),
@@ -552,8 +556,16 @@ impl VoiceHub {
     }
 }
 
+/// The speech service the settings name. Settings validation keeps it one of the two the
+/// app knows, so the fallback is only for a value that never went through it.
+fn voice_provider(settings: &Settings) -> voice::transcribe::Provider {
+    voice::transcribe::Provider::from_id(&settings.speech_provider)
+        .unwrap_or(voice::transcribe::DEFAULT_PROVIDER)
+}
+
 fn voice_config(settings: &Settings) -> voice::Config {
     voice::Config::new(settings.voice_enabled, settings.wake_phrase_enabled, settings.wake_phrase.clone())
+        .with_provider(voice_provider(settings))
 }
 
 /// A push may not start while the assistant is busy (a typed message is refused the
@@ -567,8 +579,9 @@ fn voice_gate(app: &AppHandle) -> Option<String> {
     if integrations::PAUSED.load(Ordering::Relaxed) {
         return Some("Coucou is paused.".to_string());
     }
-    if !secrets::present(voice::transcribe::KEY_NAME) {
-        return Some(voice::transcribe::NO_KEY.to_string());
+    let provider = voice_provider(&app.state::<Shared>().settings.lock().unwrap());
+    if !secrets::present(provider.key_name()) {
+        return Some(provider.no_key_message());
     }
     None
 }
@@ -617,6 +630,7 @@ fn apply_voice(app: &AppHandle, reregister: bool) {
 
 fn voice_status(app: &AppHandle) -> VoiceStatus {
     let settings = app.state::<Shared>().settings.lock().unwrap().clone();
+    let provider = voice_provider(&settings);
     // A page can ask before setup has made the hub; it then simply sees "off".
     let hub = app.try_state::<VoiceHub>();
     let (shortcut_state, problem) = match hub.as_ref().map(|h| h.shortcut.lock().unwrap().clone()) {
@@ -630,7 +644,9 @@ fn voice_status(app: &AppHandle) -> VoiceStatus {
         shortcut: settings.voice_shortcut,
         shortcut_state,
         problem,
-        has_key: secrets::present(voice::transcribe::KEY_NAME),
+        provider: provider.id(),
+        provider_label: provider.label(),
+        has_key: secrets::present(provider.key_name()),
         phase: hub.map_or(voice::Phase::Idle, |h| h.voice.phase()),
     }
 }
