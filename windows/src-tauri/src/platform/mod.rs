@@ -15,6 +15,14 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use self::linux::*;
 
+// Push-to-talk: the global shortcut and the microphone.
+#[cfg(windows)]
+#[path = "windows_voice.rs"]
+pub mod voice;
+#[cfg(target_os = "linux")]
+#[path = "linux_voice.rs"]
+pub mod voice;
+
 /// Wall-clock time in the user's time zone, for log lines and backup names.
 pub struct LocalTime {
     pub year: u32,

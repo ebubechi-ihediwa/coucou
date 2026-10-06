@@ -159,6 +159,8 @@ export class Island {
         });
       },
       cancelAssistant: () => void Bridge.assistantCancel(),
+      cancelVoice: () => void Bridge.voiceCancel(),
+      finishVoice: () => void Bridge.voiceStop(),
       toggleSound: () => {
         State.settings.soundEnabled = !State.settings.soundEnabled;
         Sound.setEnabled(State.settings.soundEnabled);
@@ -560,7 +562,10 @@ export class Island {
     });
 
     window.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && State.mode === "expanded" && !State.isPinned) this.collapse();
+      // Escape while the microphone is on or its recording is being transcribed
+      // cancels that, and nothing else.
+      if (e.key === "Escape" && State.voice.phase !== "idle") void Bridge.voiceCancel();
+      else if (e.key === "Escape" && State.mode === "expanded" && !State.isPinned) this.collapse();
       State.lastActivity = performance.now();
     });
 

@@ -22,6 +22,8 @@ export const ICONS = {
   chevronLeft: "M15 5.5 8.5 12 15 18.5",
   // checkmark
   check: "M5 12.5 9.5 17 19 7.5",
+  // mic.fill
+  mic: "M12 3a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3zM6.3 11a.9.9 0 0 1 1.8 0 3.9 3.9 0 0 0 7.8 0 .9.9 0 0 1 1.8 0 5.7 5.7 0 0 1-4.8 5.63V19.2h2.2V21H8.9v-1.8h2.2v-2.57A5.7 5.7 0 0 1 6.3 11z",
   // arrow.up (send)
   arrowUp: "M12 4.5 5.5 11l1.5 1.5 4-4V19.5h2V8.5l4 4L18.5 11 12 4.5z",
   // exclamationmark

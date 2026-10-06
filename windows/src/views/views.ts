@@ -25,6 +25,10 @@ export interface ViewActions {
   decideAction(approve: boolean): void;
   /** Stop the assistant: the request, a waiting proposal, or an action not yet started. */
   cancelAssistant(): void;
+  /** Stop listening or transcribing. Nothing is submitted. */
+  cancelVoice(): void;
+  /** The microphone button's second press: stop recording and transcribe. */
+  finishVoice(): void;
   toggleSound(): void;
   setVolume(v: number): void;
   setAutoClose(seconds: number): void;
@@ -377,6 +381,56 @@ function buildAction(actions: ViewActions): ViewHost {
   };
 }
 
+// ── Voice ─────────────────────────────────────────────────────────────────────
+
+/**
+ * Push-to-talk, while it is happening: "Listening…" with a red dot that says the
+ * microphone is on, then "Transcribing…" once it is off. The dot only blinks while
+ * this view is the open one (the page pauses every endless animation otherwise), so
+ * a hidden island costs nothing.
+ */
+function buildVoice(actions: ViewActions): ViewHost {
+  const who = h("div");
+  const title = h("div", { class: "title" });
+  const sub = h("div", { class: "sub" });
+  const row = h("div", { class: "actions" });
+  const el = h("div", { class: "view" }, card("red", stack(116, 16, who, title, sub, row)));
+  let rowKey = "";
+  return {
+    el,
+    sync() {
+      const { phase, note, viaButton } = State.voice;
+      const listening = phase === "listening";
+      clear(who);
+      who.append(
+        h(
+          "div",
+          { class: "who-row" },
+          listening ? h("i", { class: "pulse rec", title: "The microphone is on" }) : null,
+          h("span", { text: listening ? "Microphone on" : "Microphone off" }),
+        ),
+      );
+      title.textContent = listening ? "Listening…" : "Transcribing…";
+      if (listening) {
+        sub.textContent = viaButton
+          ? "Press Done when you have finished."
+          : `Let go of ${State.settings.voiceShortcut} when you have finished.`;
+      } else {
+        sub.textContent = note ?? "";
+      }
+
+      // Built once per state: rebuilding a button between a press and a release would
+      // swallow the click.
+      const key = `${phase}:${viaButton}`;
+      if (rowKey === key) return;
+      rowKey = key;
+      clear(row);
+      row.append(btn("Cancel", "secondary", () => actions.cancelVoice()));
+      if (listening && viaButton) row.append(btn("Done", "primary", () => actions.finishVoice()));
+    },
+  };
+}
+
 // ── Question ──────────────────────────────────────────────────────────────────
 
 function buildQuestion(): ViewHost {
@@ -552,6 +606,7 @@ export function buildViews(
   map.set("empty", buildEmpty(actions));
   map.set("approval", buildApproval(actions));
   map.set("action", buildAction(actions));
+  map.set("voice", buildVoice(actions));
   map.set("question", buildQuestion());
   map.set("error", buildError(actions));
   map.set("finished", buildFinished(actions));

@@ -10,6 +10,17 @@ import type { ViewHost } from "./views";
 
 let nextId = 1;
 
+/**
+ * Set while the chat view exists. What was said into the microphone is submitted
+ * through the very function a typed message goes through, so a spoken request and a
+ * typed one are the same request.
+ */
+let submitText: ((text: string) => void) | null = null;
+
+export function submitVoiceQuery(text: string) {
+  submitText?.(text);
+}
+
 function bubble(message: ChatMessage): HTMLElement {
   if (message.role === "user") {
     return h(
@@ -46,7 +57,10 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
     spellcheck: "false",
   }) as HTMLInputElement;
   const send = h("button", { class: "send-btn", title: "Send" }, svg(ICONS.arrowUp, 11));
-  const bar = h("div", { class: "chat-bar" }, input, send);
+  // The microphone button: the same push-to-talk as the shortcut, for anyone who would
+  // rather click. First press starts, second press stops.
+  const mic = h("button", { class: "send-btn mic-btn", title: "Speak" }, svg(ICONS.mic, 12));
+  const bar = h("div", { class: "chat-bar" }, input, mic, send);
 
   const el = h(
     "div",
@@ -103,6 +117,26 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
     }
   }
 
+  submitText = (text) => {
+    if (sending) return; // Rust refuses a push while a request is running; belt and braces
+    input.value = text;
+    void submit();
+  };
+
+  mic.addEventListener("click", () => {
+    if (State.voice.phase !== "idle") {
+      void Bridge.voiceStop();
+      return;
+    }
+    State.voice.viaButton = true;
+    Bridge.voiceStart().catch((err) => {
+      State.voice.viaButton = false;
+      State.noteMessage = String(err).replace(/^Error:\s*/, "");
+      State.view = "note";
+      State.notify();
+    });
+  });
+
   // While a request is in flight the button is Stop: the person can always cancel.
   send.addEventListener("click", () => (sending ? void Bridge.assistantCancel() : void submit()));
   let showingStop = false;
@@ -137,6 +171,9 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
 
       input.placeholder = State.chatHistory.length === 0 ? "Ask me anything…" : "Continue…";
       input.disabled = sending;
+      const voiceOn = State.settings.voiceEnabled;
+      mic.disabled = sending || !voiceOn;
+      mic.title = voiceOn ? "Speak" : "Voice is off. Turn it on in Settings.";
       // Swapped only when it changes: rebuilding a button between a mouse-down and
       // a mouse-up would swallow the click.
       if (sending !== showingStop) {

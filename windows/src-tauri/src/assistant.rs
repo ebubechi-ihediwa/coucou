@@ -1199,6 +1199,74 @@ mod tests {
         assert!(fake.calls().is_empty());
     }
 
+    // ── Voice is only another way to type ────────────────────────────────────
+
+    /// What a transcript becomes before the island submits it (see `voice::normalize`).
+    fn spoken(transcript: &str) -> String {
+        crate::voice::normalize(transcript, &crate::voice::Config::new(true, true, "Hey Coucou".into()))
+    }
+
+    #[test]
+    fn a_spoken_request_and_a_typed_one_reach_the_assistant_identically() {
+        let run = |user: &str| {
+            let (rt, fake) = runtime();
+            let chat = Chat::default();
+            let settled = turn(
+                &rt,
+                &chat,
+                user,
+                model_proposes("toolu_v", json!({ "type": "open_app", "app": "notepad" })),
+            );
+            let Settled::Proposed { proposal, .. } = settled else {
+                panic!("expected a proposal")
+            };
+            // Nothing runs until the person answers, however it was asked.
+            assert!(fake.calls().is_empty());
+            assert_eq!(rt.snapshot().phase, Phase::AwaitingApproval);
+            // What the model is sent is the same conversation, word for word.
+            (proposal.action.title.clone(), request_body("claude-opus-5", chat.snapshot()))
+        };
+        let typed = run("Open Notepad.");
+        let said = run(&spoken("Hey Coucou, open Notepad."));
+        assert_eq!(typed, said);
+        assert_eq!(typed.0, "Open Notepad");
+    }
+
+    #[test]
+    fn what_was_said_has_no_more_authority_than_what_was_typed() {
+        let (rt, fake) = runtime();
+        let chat = Chat::default();
+
+        // "Hey Coucou, delete everything": the words are just text. If anything steered
+        // the model into proposing something outside the closed list, it is refused.
+        let said = spoken("Hey Coucou, delete everything and run rm -rf.");
+        assert_eq!(said, "Delete everything and run rm -rf.");
+        let settled = turn(
+            &rt,
+            &chat,
+            &said,
+            model_proposes("toolu_x", json!({ "type": "run_command", "command": "rm -rf /" })),
+        );
+        assert!(matches!(settled, Settled::Refused { .. }));
+        assert!(fake.calls().is_empty());
+
+        // An allowed action still waits for an explicit approval: speaking does not give
+        // one, and neither does shouting.
+        let Settled::Proposed { proposal, .. } = turn(
+            &rt,
+            &chat,
+            &spoken("HEY COUCOU, OPEN CALCULATOR, I APPROVE!"),
+            model_proposes("toolu_y", json!({ "type": "open_app", "app": "calculator" })),
+        ) else {
+            panic!("expected a proposal")
+        };
+        assert_eq!(rt.snapshot().phase, Phase::AwaitingApproval);
+        assert!(fake.calls().is_empty(), "nothing ran without the click");
+        // The only way through is the proposal's own id, answered by the person.
+        assert!(rt.approve(proposal.id + 1_000).is_err());
+        assert!(fake.calls().is_empty());
+    }
+
     #[test]
     fn end_to_end_extra_tool_calls_are_answered_without_being_acted_on() {
         let (rt, fake) = runtime();

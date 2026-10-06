@@ -22,7 +22,8 @@ export type IslandViewName =
   | "note"
   | "settings"
   | "greeting"
-  | "action";
+  | "action"
+  | "voice";
 
 export type BotStateName =
   | "idle"
@@ -90,6 +91,8 @@ export const VIEW_LAYOUTS: Record<IslandViewName, ViewLayout> = {
   // A proposed desktop action. Taller than a permission card: a link or file name
   // gets a line of its own under the title, and the buttons must not be cut off.
   action: { height: 200, botX: 62, botY: null, botDiameter: 56, agentMode: "column" },
+  // Listening, or turning what was said into text. Same size as a note.
+  voice: { height: 160, botX: 60, botY: null, botDiameter: 50, agentMode: "column" },
 };
 
 // The upload views above are only the fallback geometry. Once a file is actually

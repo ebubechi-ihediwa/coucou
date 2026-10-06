@@ -26,7 +26,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 ///
 /// 0 → 1: `model` was added to the unversioned format (commit cd50852), so the
 /// oldest files lack it; the version field itself is new.
-const FORMAT_VERSION: u32 = 1;
+/// 1 → 2: push-to-talk voice (`voiceEnabled`, `voiceShortcut`, `wakePhraseEnabled`,
+/// `wakePhrase`).
+const FORMAT_VERSION: u32 = 2;
 
 const FILE: &str = "settings.json";
 /// A settings file is a few hundred bytes. Anything this big is not one.
@@ -56,10 +58,34 @@ pub struct Settings {
     /// Defaulted explicitly so a settings.json written by an older build still loads.
     #[serde(default = "default_model")]
     pub model: String,
+    /// Push-to-talk: the global shortcut and the microphone behind it. Off means
+    /// the shortcut is not registered and the microphone is never opened.
+    #[serde(default = "default_true")]
+    pub voice_enabled: bool,
+    /// Written like "Ctrl+Alt+Space"; always a valid one (see voice::shortcut).
+    #[serde(default = "default_voice_shortcut")]
+    pub voice_shortcut: String,
+    /// Whether a leading wake phrase is removed from what was said.
+    #[serde(default = "default_true")]
+    pub wake_phrase_enabled: bool,
+    #[serde(default = "default_wake_phrase")]
+    pub wake_phrase: String,
 }
 
 fn default_model() -> String {
     crate::claude::DEFAULT_MODEL.to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_voice_shortcut() -> String {
+    crate::voice::shortcut::DEFAULT.to_string()
+}
+
+fn default_wake_phrase() -> String {
+    crate::voice::wake::DEFAULT_PHRASE.to_string()
 }
 
 impl Default for Settings {
@@ -79,6 +105,10 @@ impl Default for Settings {
             autostart: false,
             hooks_installed: false,
             model: default_model(),
+            voice_enabled: true,
+            voice_shortcut: default_voice_shortcut(),
+            wake_phrase_enabled: true,
+            wake_phrase: default_wake_phrase(),
         }
     }
 }
@@ -140,6 +170,23 @@ fn sanitize(s: &mut Settings) -> Vec<&'static str> {
     } else if model != s.model {
         s.model = model;
         changed.push("model");
+    }
+
+    // A shortcut that cannot be registered is no shortcut: it goes back to the
+    // default rather than leaving push-to-talk with nothing to press. Anything
+    // valid is stored in its canonical spelling.
+    let shortcut = crate::voice::shortcut::canonical_or_default(&s.voice_shortcut);
+    if shortcut != s.voice_shortcut {
+        s.voice_shortcut = shortcut;
+        changed.push("voiceShortcut");
+    }
+    let phrase = s.wake_phrase.trim().to_string();
+    if !crate::voice::wake::valid_phrase(&phrase) {
+        s.wake_phrase = d.wake_phrase;
+        changed.push("wakePhrase");
+    } else if phrase != s.wake_phrase {
+        s.wake_phrase = phrase;
+        changed.push("wakePhrase");
     }
 
     // The ids decide which services get polled over the network: only well-formed,
@@ -334,6 +381,7 @@ fn migrate(object: &mut Map<String, Value>, from: u32) {
     while version < FORMAT_VERSION {
         match version {
             0 => migrate_0_to_1(object),
+            1 => migrate_1_to_2(object),
             _ => break,
         }
         version += 1;
@@ -348,6 +396,19 @@ fn migrate_0_to_1(object: &mut Map<String, Value>) {
     object
         .entry("model")
         .or_insert_with(|| default_model().into());
+}
+
+/// Version 2 added push-to-talk. A version 1 file has none of it, so it gets the
+/// defaults; whatever it did say is carried over untouched.
+fn migrate_1_to_2(object: &mut Map<String, Value>) {
+    object.entry("voiceEnabled").or_insert(true.into());
+    object
+        .entry("voiceShortcut")
+        .or_insert_with(|| default_voice_shortcut().into());
+    object.entry("wakePhraseEnabled").or_insert(true.into());
+    object
+        .entry("wakePhrase")
+        .or_insert_with(|| default_wake_phrase().into());
 }
 
 /// Reads each field on its own, so a wrong type costs that field and no other.
@@ -404,6 +465,28 @@ fn from_object(object: &Map<String, Value>, notes: &mut Vec<String>) -> Settings
             notes,
             |v| v.as_str().map(String::from),
             d.model,
+        ),
+        voice_enabled: field(object, "voiceEnabled", notes, Value::as_bool, d.voice_enabled),
+        voice_shortcut: field(
+            object,
+            "voiceShortcut",
+            notes,
+            |v| v.as_str().map(String::from),
+            d.voice_shortcut,
+        ),
+        wake_phrase_enabled: field(
+            object,
+            "wakePhraseEnabled",
+            notes,
+            Value::as_bool,
+            d.wake_phrase_enabled,
+        ),
+        wake_phrase: field(
+            object,
+            "wakePhrase",
+            notes,
+            |v| v.as_str().map(String::from),
+            d.wake_phrase,
         ),
     };
     for name in sanitize(&mut s) {
@@ -628,6 +711,12 @@ mod tests {
             autostart: true,
             hooks_installed: true,
             model: "claude-sonnet-5".into(),
+            // Voice came later: files that predate it get these, so they are the
+            // defaults here. `voice_settings` below exercises non-default values.
+            voice_enabled: true,
+            voice_shortcut: default_voice_shortcut(),
+            wake_phrase_enabled: true,
+            wake_phrase: default_wake_phrase(),
         }
     }
 
@@ -683,7 +772,7 @@ mod tests {
         let dir = Dir::new("valid");
         save_to(&dir.0, &custom()).unwrap();
         let before = dir.read();
-        assert!(before.contains("\"version\": 1"), "{before}");
+        assert!(before.contains("\"version\": 2"), "{before}");
 
         let loaded = load_from(&dir.0);
         assert_eq!(loaded.settings, custom());
@@ -695,7 +784,7 @@ mod tests {
     #[test]
     fn a_missing_field_gets_its_default_and_the_others_survive() {
         let dir = Dir::new("missing");
-        dir.put(r#"{ "version": 1, "soundEnabled": false, "screen": "cursor" }"#);
+        dir.put(r#"{ "version": 2, "soundEnabled": false, "screen": "cursor" }"#);
         let loaded = load_from(&dir.0);
         let d = Settings::default();
         assert!(!loaded.settings.sound_enabled);
@@ -885,7 +974,7 @@ mod tests {
     #[test]
     fn unknown_fields_are_ignored() {
         let dir = Dir::new("unknown");
-        dir.put(r#"{ "version": 1, "soundEnabled": false, "futureThing": { "a": 1 }, "theme": "dark" }"#);
+        dir.put(r#"{ "version": 2, "soundEnabled": false, "futureThing": { "a": 1 }, "theme": "dark" }"#);
         let loaded = load_from(&dir.0);
         assert!(!loaded.settings.sound_enabled);
         assert!(loaded.notes.is_empty(), "{:?}", loaded.notes);
@@ -921,7 +1010,7 @@ mod tests {
             std::fs::read_to_string(dir.0.join("settings.json.v7.bak")).unwrap(),
             newer
         );
-        assert!(dir.read().contains("\"version\": 1"));
+        assert!(dir.read().contains("\"version\": 2"));
         // A second save does not replace the backup with our own output.
         save_to(&dir.0, &Settings::default()).unwrap();
         assert_eq!(
@@ -950,7 +1039,7 @@ mod tests {
 
         // The file is now current, and the original is kept byte for byte.
         let rewritten: Value = serde_json::from_str(&dir.read()).unwrap();
-        assert_eq!(rewritten["version"], 1);
+        assert_eq!(rewritten["version"], 2);
         assert_eq!(rewritten["model"], default_model());
         assert_eq!(
             std::fs::read_to_string(dir.0.join("settings.json.v0.bak")).unwrap(),
@@ -972,7 +1061,7 @@ mod tests {
             std::fs::read_to_string(dir.0.join("settings.json.v0.bak")).unwrap(),
             text
         );
-        assert!(dir.read().contains("\"version\": 1"));
+        assert!(dir.read().contains("\"version\": 2"));
     }
 
     #[test]
@@ -1056,10 +1145,150 @@ mod tests {
         let loaded = load_from(&dir.0);
         assert!(!loaded.settings.sound_enabled);
         assert!(
-            dir.read().contains("\"version\": 1"),
+            dir.read().contains("\"version\": 2"),
             "stamped with the real version"
         );
         assert!(dir.0.join("settings.json.v0.bak").exists());
+    }
+
+    // ── Push-to-talk settings (version 2) ────────────────────────────────────
+
+    /// What the M1.1 build wrote: version 1, a model, no voice.
+    const V1_BEFORE_VOICE: &str = r#"{
+  "version": 1,
+  "soundEnabled": false,
+  "soundVolume": 0.05,
+  "autoCloseInterval": 30.0,
+  "absenceInterval": 600.0,
+  "activeIntegrations": ["integration_stripe", "integration_calcom"],
+  "screen": "cursor",
+  "autostart": true,
+  "hooksInstalled": true,
+  "model": "claude-sonnet-5"
+}"#;
+
+    #[test]
+    fn the_voice_defaults_are_the_documented_ones() {
+        let d = Settings::default();
+        assert!(d.voice_enabled);
+        assert_eq!(d.voice_shortcut, "Ctrl+Alt+Space");
+        assert!(d.wake_phrase_enabled);
+        assert_eq!(d.wake_phrase, "Hey Coucou");
+    }
+
+    #[test]
+    fn a_version_1_file_migrates_to_2_keeping_everything_and_adding_voice() {
+        let dir = Dir::new("v1");
+        dir.put(V1_BEFORE_VOICE);
+        let loaded = load_from(&dir.0);
+        assert_eq!(loaded.settings, custom(), "every earlier preference kept, voice at its defaults");
+        assert!(loaded.notes.iter().any(|n| n.contains("from version 1 to 2")), "{:?}", loaded.notes);
+
+        // The file is current now and the original is kept byte for byte.
+        let rewritten: Value = serde_json::from_str(&dir.read()).unwrap();
+        assert_eq!(rewritten["version"], 2);
+        assert_eq!(rewritten["voiceEnabled"], true);
+        assert_eq!(rewritten["voiceShortcut"], "Ctrl+Alt+Space");
+        assert_eq!(rewritten["wakePhraseEnabled"], true);
+        assert_eq!(rewritten["wakePhrase"], "Hey Coucou");
+        assert_eq!(rewritten["model"], "claude-sonnet-5");
+        assert_eq!(std::fs::read_to_string(dir.0.join("settings.json.v1.bak")).unwrap(), V1_BEFORE_VOICE);
+        // And starting again changes nothing.
+        let again = load_from(&dir.0);
+        assert_eq!(again.settings, custom());
+        assert!(again.notes.is_empty(), "{:?}", again.notes);
+    }
+
+    #[test]
+    fn the_oldest_files_reach_version_2_in_one_start() {
+        let dir = Dir::new("v0-to-2");
+        dir.put(V0_FIRST_BUILD);
+        let loaded = load_from(&dir.0);
+        assert_eq!(loaded.settings, first_build());
+        let rewritten: Value = serde_json::from_str(&dir.read()).unwrap();
+        assert_eq!(rewritten["version"], 2);
+        assert_eq!(rewritten["voiceShortcut"], "Ctrl+Alt+Space");
+    }
+
+    fn voice_settings() -> Settings {
+        Settings {
+            voice_enabled: false,
+            voice_shortcut: "Ctrl+Shift+K".into(),
+            wake_phrase_enabled: false,
+            wake_phrase: "OK Mochi".into(),
+            ..custom()
+        }
+    }
+
+    #[test]
+    fn custom_voice_settings_survive_a_save_and_a_reload() {
+        let dir = Dir::new("voice-roundtrip");
+        save_to(&dir.0, &voice_settings()).unwrap();
+        let loaded = load_from(&dir.0);
+        assert_eq!(loaded.settings, voice_settings());
+        assert!(loaded.notes.is_empty(), "{:?}", loaded.notes);
+        let on_disk: Value = serde_json::from_str(&dir.read()).unwrap();
+        assert_eq!(on_disk["voiceEnabled"], false);
+        assert_eq!(on_disk["voiceShortcut"], "Ctrl+Shift+K");
+        assert_eq!(on_disk["wakePhraseEnabled"], false);
+        assert_eq!(on_disk["wakePhrase"], "OK Mochi");
+    }
+
+    #[test]
+    fn a_shortcut_is_stored_in_its_canonical_form() {
+        let mut s = Settings { voice_shortcut: " alt + control + SPACE ".into(), ..Settings::default() };
+        assert_eq!(sanitize(&mut s), vec!["voiceShortcut"]);
+        assert_eq!(s.voice_shortcut, "Ctrl+Alt+Space");
+    }
+
+    #[test]
+    fn an_invalid_shortcut_goes_back_to_the_default_and_nothing_else_changes() {
+        for bad in ["", "Space", "Ctrl+C", "Ctrl+Alt", "Ctrl+Alt+Banana", "Alt+F4", "Ctrl++Space", "<script>"] {
+            let mut s = Settings { voice_shortcut: bad.into(), voice_enabled: false, ..custom() };
+            let changed = sanitize(&mut s);
+            assert_eq!(changed, vec!["voiceShortcut"], "{bad:?}");
+            assert_eq!(s.voice_shortcut, "Ctrl+Alt+Space", "{bad:?}");
+            assert!(!s.voice_enabled && s.screen == "cursor", "only the shortcut was touched: {bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_invalid_wake_phrase_goes_back_to_the_default_and_a_valid_one_is_trimmed() {
+        let too_long = "a".repeat(41);
+        for bad in ["", "   ", "!!!", "hey <b>coucou</b>", "new\nline", too_long.as_str()] {
+            let mut s = Settings { wake_phrase: bad.into(), ..Settings::default() };
+            assert_eq!(sanitize(&mut s), vec!["wakePhrase"], "{bad:?}");
+            assert_eq!(s.wake_phrase, "Hey Coucou");
+        }
+        let mut s = Settings { wake_phrase: "  Ok Mochi  ".into(), ..Settings::default() };
+        assert_eq!(sanitize(&mut s), vec!["wakePhrase"]);
+        assert_eq!(s.wake_phrase, "Ok Mochi");
+    }
+
+    #[test]
+    fn wrong_typed_voice_values_cost_only_themselves() {
+        let dir = Dir::new("voice-badtypes");
+        dir.put(
+            r#"{ "version": 2, "soundEnabled": false, "voiceEnabled": "yes",
+                 "voiceShortcut": 42, "wakePhraseEnabled": false, "wakePhrase": ["Hey"] }"#,
+        );
+        let s = load_from(&dir.0).settings;
+        let d = Settings::default();
+        assert!(!s.sound_enabled, "unrelated values survive");
+        assert!(!s.wake_phrase_enabled, "a valid voice value survives too");
+        assert_eq!(s.voice_enabled, d.voice_enabled);
+        assert_eq!(s.voice_shortcut, d.voice_shortcut);
+        assert_eq!(s.wake_phrase, d.wake_phrase);
+    }
+
+    #[test]
+    fn an_invalid_shortcut_in_a_file_is_corrected_on_load() {
+        let dir = Dir::new("voice-badshortcut");
+        dir.put(r#"{ "version": 2, "voiceShortcut": "Ctrl+C", "voiceEnabled": false }"#);
+        let loaded = load_from(&dir.0);
+        assert_eq!(loaded.settings.voice_shortcut, "Ctrl+Alt+Space");
+        assert!(!loaded.settings.voice_enabled);
+        assert!(loaded.notes.iter().any(|n| n.contains("voiceShortcut")), "{:?}", loaded.notes);
     }
 
     // ── Malformed files ──────────────────────────────────────────────────────
