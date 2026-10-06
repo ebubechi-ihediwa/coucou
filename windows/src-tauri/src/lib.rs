@@ -489,19 +489,13 @@ pub struct VoiceStatus {
     phase: voice::Phase,
 }
 
-/// Carries what the controller says to the island, and makes sure the keyboard hook
-/// that watches for the release never outlives the push.
+/// Carries what the controller says to the island.
 struct IslandSink {
     app: AppHandle,
 }
 
 impl voice::Sink for IslandSink {
     fn publish(&self, event: voice::Event) {
-        if !matches!(event, voice::Event::Listening) {
-            if let Some(hotkey) = self.app.state::<VoiceHub>().hotkey.lock().unwrap().as_ref() {
-                hotkey.stop_watching();
-            }
-        }
         // What was said is the person's own and stays out of the log: only that
         // something happened, and how long it was.
         log::line(match &event {
@@ -531,12 +525,18 @@ impl VoiceHub {
         // One thread, asleep until the OS reports the shortcut. Not a poll.
         let worker = voice.clone();
         let spawned = std::thread::Builder::new().name("coucou-voice".into()).spawn(move || {
+            // A release ends the push its own press started, and no other: tapping the
+            // shortcut while a push begun with the button is running must not stop that
+            // one, and a late release must not stop a newer push.
+            let mut started: Option<u64> = None;
             for event in incoming {
                 match event {
-                    voice::HotkeyEvent::Pressed => {
-                        let _ = worker.begin();
+                    voice::HotkeyEvent::Pressed => started = worker.begin().ok(),
+                    voice::HotkeyEvent::Released => {
+                        if let Some(session) = started.take() {
+                            worker.end_session(session);
+                        }
                     }
-                    voice::HotkeyEvent::Released => worker.end(),
                 }
             }
         });

@@ -687,6 +687,33 @@ fn a_timer_left_over_from_an_old_push_cannot_end_a_new_one() {
     assert_eq!(rig.mic.with(|m| m.stopped), 0);
 }
 
+#[test]
+fn the_release_of_an_old_press_cannot_end_a_newer_push() {
+    let rig = Rig::new();
+    let first = rig.voice.begin().unwrap();
+    rig.next();
+    rig.voice.cancel();
+    rig.next();
+    let second = rig.voice.begin().unwrap();
+    assert_eq!(rig.next(), Event::Listening);
+    assert_ne!(first, second);
+
+    // The first press is let go late: nothing happens to the second push.
+    rig.voice.end_session(first);
+    assert_eq!(rig.voice.phase(), Phase::Listening);
+    assert_eq!(rig.mic.with(|m| m.stopped), 0);
+    rig.quiet();
+
+    // Its own release does end it.
+    rig.voice.end_session(second);
+    assert_eq!(
+        rig.next(),
+        Event::Transcribing {
+            limit_reached: false
+        }
+    );
+}
+
 // ── What comes back ───────────────────────────────────────────────────────────
 
 #[test]

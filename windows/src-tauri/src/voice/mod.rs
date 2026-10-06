@@ -257,7 +257,7 @@ impl Voice {
     }
 
     /// Starts a push: the microphone opens. Only the shortcut or the button get here.
-    pub fn begin(self: &Arc<Self>) -> Result<(), Refused> {
+    pub fn begin(self: &Arc<Self>) -> Result<u64, Refused> {
         let max = {
             let config = self.config.lock().unwrap();
             if !config.enabled {
@@ -293,12 +293,18 @@ impl Voice {
             this.finish_recording(Some(session), true);
         }));
         self.sink.publish(Event::Listening);
-        Ok(())
+        Ok(session)
     }
 
-    /// The push ended (shortcut released, or the button pressed again).
+    /// The push ended (the button pressed again).
     pub fn end(self: &Arc<Self>) {
         self.finish_recording(None, false);
+    }
+
+    /// The shortcut was released: ends the push that press started, if it is still
+    /// the one running.
+    pub fn end_session(self: &Arc<Self>, session: u64) {
+        self.finish_recording(Some(session), false);
     }
 
     /// Listening → transcribing. `session` is `Some` for the timer, which must not

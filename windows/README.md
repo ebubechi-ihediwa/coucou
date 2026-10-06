@@ -176,6 +176,38 @@ that resolve only to documents and images inside the inbox. `assistant.rs` is th
 state machine (`idle`, `thinking`, `awaiting_approval`, `executing`, `completed`,
 `failed`, `cancelled`). Opening applications is Windows-only for now.
 
+### Push-to-talk voice
+
+Hold **Ctrl+Alt+Space** anywhere (the shortcut is yours to change in **Settings… →
+Voice**), say what you want, let go. Mochi shows "Listening…" while the microphone
+is on, transcribes what you said, and submits it exactly as if you had typed it.
+"Hey Coucou, open Notepad." arrives as "Open Notepad." if the leading phrase is on.
+The microphone button in the chat does the same for anyone who would rather click.
+
+Voice is only another way to type. It does not call the model, propose an action or
+run one: the text goes through the same path as typed text, so the assistant, the
+policy and the **Allow / Deny** card judge a spoken request exactly like a typed one.
+
+- **Not always listening.** The microphone is opened by the push and by nothing
+  else, and closed when you let go, cancel, an error happens, the limit is reached
+  or the app quits. While idle there is no audio stream, no buffer, no recogniser
+  and no wake-word detection; the only thing running is Windows' own shortcut
+  notification. "Hey Coucou" is looked for in the *text* that came back, never in
+  sound.
+- **Bounded.** A push lasts 45 seconds at most (`audio::MAX_RECORDING_SECS`), and the
+  recording buffer itself stops growing at the same size, so a stuck key cannot make
+  an unbounded recording.
+- **Private.** The audio is held in memory only, sent to OpenAI's transcription
+  endpoint with your own key (saved in the Windows Credential Manager under
+  **Settings… → Voice**), and discarded. It is never written to disk. Silence, a tap
+  and a muted or blocked microphone are recognised on your computer and not uploaded.
+  What you said is not written to the log.
+- **Windows only for now.** Linux says so instead of pretending.
+
+If another program already owns the shortcut, Settings says so and lets you pick
+another. Turning voice off unregisters the shortcut, which is what makes the
+microphone unreachable.
+
 ### Idle resource use
 
 The island must cost nothing while hidden. [PERFORMANCE.md](PERFORMANCE.md) lists what

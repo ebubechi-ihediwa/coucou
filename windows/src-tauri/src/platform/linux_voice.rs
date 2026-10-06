@@ -19,8 +19,6 @@ impl Hotkey {
     ) -> Result<Hotkey, HotkeyError> {
         Err(HotkeyError::Unsupported)
     }
-
-    pub fn stop_watching(&self) {}
 }
 
 #[derive(Default)]

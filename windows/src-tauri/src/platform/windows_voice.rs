@@ -6,22 +6,28 @@
 //   * The shortcut is a `RegisterHotKey`, which costs nothing while idle and tells
 //     the program nothing about any other key. `RegisterHotKey` says when it is
 //     pressed but never when it is let go, so for the length of one push (and no
-//     longer) a low-level keyboard hook is installed. It is asked one question,
-//     "was one of the keys of the shortcut released?", it never stores or forwards a
-//     key code, and it always passes every key on to the next program.
+//     longer) the keyboard is registered for Raw Input, which is told, as an event,
+//     when a key comes up. It is asked one question, "was one of the keys of the
+//     shortcut released?"; no key code is kept, logged or sent anywhere, and the
+//     registration is removed as soon as the answer is yes.
+//
+//     Raw Input and not a low-level keyboard hook, because inside this app a hook is
+//     never called: the moment the settings window's WebView2 exists, Windows stops
+//     delivering hook callbacks to the process (found by bisecting the app's setup;
+//     the same code works in a bare process). Raw Input is delivered either way.
 //   * The microphone is `waveIn`: it hands over 16 kHz mono 16-bit audio whatever the
 //     device really does, in 100 ms pieces, and signals an event for each, so the
 //     recording thread sleeps between them. It opens on `start` and is closed, with
 //     its buffers freed, before `stop` or `cancel` returns.
 
-use std::cell::RefCell;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use ::windows::core::{w, PCWSTR};
 use ::windows::Win32::Foundation::{
-    CloseHandle, ERROR_HOTKEY_ALREADY_REGISTERED, HANDLE, LPARAM, LRESULT, WPARAM,
+    CloseHandle, ERROR_HOTKEY_ALREADY_REGISTERED, HANDLE, HWND, LPARAM, WPARAM,
 };
 use ::windows::Win32::Media::Audio::{
     waveInAddBuffer, waveInClose, waveInGetNumDevs, waveInOpen, waveInPrepareHeader, waveInReset,
@@ -34,10 +40,14 @@ use ::windows::Win32::System::Threading::{
 use ::windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
 };
+use ::windows::Win32::UI::Input::{
+    GetRawInputData, RegisterRawInputDevices, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER,
+    RIDEV_INPUTSINK, RIDEV_REMOVE, RID_INPUT, RIM_TYPEKEYBOARD,
+};
 use ::windows::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetMessageW, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, PM_NOREMOVE, WH_KEYBOARD_LL, WM_APP,
-    WM_HOTKEY, WM_KEYUP, WM_QUIT, WM_SYSKEYUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetMessageW, PeekMessageW, PostThreadMessageW,
+    HWND_MESSAGE, MSG, PM_NOREMOVE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_HOTKEY, WM_INPUT,
+    WM_QUIT,
 };
 
 use crate::voice::audio::{self, Recording};
@@ -49,14 +59,13 @@ pub const SUPPORTED: bool = true;
 // ── The shortcut ──────────────────────────────────────────────────────────────
 
 const HOTKEY_ID: i32 = 0x436F; // "Co"
-/// Posted to the shortcut's own thread.
+/// Posted to the shortcut's own thread when a press must be ended at once.
 const WM_RELEASED: u32 = WM_APP + 1;
-const WM_STOP_WATCHING: u32 = WM_APP + 2;
-
-thread_local! {
-    /// The keys whose release ends the push. Read by the hook, on the same thread.
-    static WATCHED: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
-}
+/// HID usage page and usage of a keyboard.
+const GENERIC_DESKTOP: u16 = 1;
+const KEYBOARD: u16 = 6;
+/// `RAWKEYBOARD.Flags`: the key came up.
+const RI_KEY_BREAK: u16 = 1;
 
 /// A registered shortcut. Dropping it unregisters the shortcut and ends its thread.
 pub struct Hotkey {
@@ -89,14 +98,6 @@ impl Hotkey {
             Err(_) => Err(HotkeyError::Failed),
         }
     }
-
-    /// The push ended some other way (cancel, time limit): stop watching for the
-    /// release, so no keyboard hook outlives the recording.
-    pub fn stop_watching(&self) {
-        unsafe {
-            let _ = PostThreadMessageW(self.thread_id, WM_STOP_WATCHING, WPARAM(0), LPARAM(0));
-        }
-    }
 }
 
 impl Drop for Hotkey {
@@ -121,6 +122,26 @@ fn shortcut_thread(
         let _ = PeekMessageW(&mut msg, None, WM_APP, WM_APP, PM_NOREMOVE);
         let thread_id = GetCurrentThreadId();
 
+        // Raw Input is delivered to a window. This one is message-only: it is never
+        // drawn, never in the taskbar and takes no focus.
+        let Ok(window) = CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("STATIC"),
+            PCWSTR::null(),
+            WINDOW_STYLE(0),
+            0,
+            0,
+            0,
+            0,
+            Some(HWND_MESSAGE),
+            None,
+            None,
+            None,
+        ) else {
+            let _ = ready.send(Err(HotkeyError::Failed));
+            return;
+        };
+
         let flags = HOT_KEY_MODIFIERS(shortcut.modifier_flags()) | MOD_NOREPEAT;
         if let Err(error) = RegisterHotKey(None, HOTKEY_ID, flags, shortcut.virtual_key()) {
             let why = if error.code() == ERROR_HOTKEY_ALREADY_REGISTERED.to_hresult() {
@@ -128,64 +149,101 @@ fn shortcut_thread(
             } else {
                 HotkeyError::Failed
             };
+            let _ = DestroyWindow(window);
             let _ = ready.send(Err(why));
             return;
         }
         let _ = ready.send(Ok(thread_id));
 
-        let mut hook: Option<HHOOK> = None;
-        let unhook = |hook: &mut Option<HHOOK>| {
-            if let Some(h) = hook.take() {
-                let _ = UnhookWindowsHookEx(h);
-            }
-            WATCHED.with(|w| w.borrow_mut().clear());
+        // The keys whose release ends a push.
+        let watched = shortcut.release_keys();
+        // Listening for key-ups is switched on for a push and off again after it.
+        let watch = |on: bool| -> bool {
+            let device = RAWINPUTDEVICE {
+                usUsagePage: GENERIC_DESKTOP,
+                usUsage: KEYBOARD,
+                dwFlags: if on { RIDEV_INPUTSINK } else { RIDEV_REMOVE },
+                hwndTarget: if on { window } else { HWND::default() },
+            };
+            RegisterRawInputDevices(&[device], size_of::<RAWINPUTDEVICE>() as u32).is_ok()
         };
+        // Whether a push is being watched, and which one: a release message that
+        // belongs to an earlier push is ignored.
+        let mut watching = false;
+        let mut push = 0usize;
 
         // 0 is WM_QUIT; -1 is an error. Either ends the thread.
         while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
             match msg.message {
                 WM_HOTKEY if msg.wParam.0 as i32 == HOTKEY_ID => {
-                    if hook.is_none() {
-                        WATCHED.with(|w| *w.borrow_mut() = shortcut.release_keys());
-                        hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(release_hook), None, 0).ok();
-                        // The key may have come up before the hook was in place; one
-                        // look, not a loop.
-                        let still_down =
-                            GetAsyncKeyState(shortcut.virtual_key() as i32) as u16 & 0x8000 != 0;
-                        if hook.is_none() || !still_down {
-                            let _ =
-                                PostThreadMessageW(thread_id, WM_RELEASED, WPARAM(0), LPARAM(0));
-                        }
-                    }
-                    on_event(HotkeyEvent::Pressed);
-                }
-                WM_RELEASED => {
-                    if hook.is_some() {
-                        unhook(&mut hook);
+                    if watching {
+                        // Pressed again before the last release was handled: close the
+                        // old push first, so every press has its own release.
+                        watch(false);
                         on_event(HotkeyEvent::Released);
                     }
+                    watching = true;
+                    push += 1;
+                    let registered = watch(true);
+                    // The key may have come up before the registration was in place;
+                    // one look, not a loop. If it could not be registered at all,
+                    // nothing could ever say the key came up, so the push is ended at
+                    // once rather than left to the time limit.
+                    let still_down =
+                        GetAsyncKeyState(shortcut.virtual_key() as i32) as u16 & 0x8000 != 0;
+                    on_event(HotkeyEvent::Pressed);
+                    if !registered || !still_down {
+                        let _ = PostThreadMessageW(thread_id, WM_RELEASED, WPARAM(push), LPARAM(0));
+                    }
                 }
-                WM_STOP_WATCHING => unhook(&mut hook),
+                WM_INPUT => {
+                    if watching {
+                        if let Some((key, up)) = read_key(HRAWINPUT(msg.lParam.0 as *mut _)) {
+                            if up && watched.contains(&key) {
+                                watching = false;
+                                watch(false);
+                                on_event(HotkeyEvent::Released);
+                            }
+                        }
+                    }
+                    // The system asks every WM_INPUT to be passed on, so it can clean up.
+                    let _ = DefWindowProcW(msg.hwnd, WM_INPUT, msg.wParam, msg.lParam);
+                }
+                WM_RELEASED if watching && msg.wParam.0 == push => {
+                    watching = false;
+                    watch(false);
+                    on_event(HotkeyEvent::Released);
+                }
                 _ => {}
             }
         }
-        unhook(&mut hook);
+        if watching {
+            watch(false);
+        }
         let _ = UnregisterHotKey(None, HOTKEY_ID);
+        let _ = DestroyWindow(window);
     }
 }
 
-/// Runs for every key while a push is in progress. Only asks whether the key that
-/// came up is one of the shortcut's; passes every key on untouched.
-unsafe extern "system" fn release_hook(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 && matches!(wparam.0 as u32, WM_KEYUP | WM_SYSKEYUP) {
-        let key = unsafe { (*(lparam.0 as *const KBDLLHOOKSTRUCT)).vkCode };
-        if WATCHED.with(|w| w.borrow().contains(&key)) {
-            unsafe {
-                let _ = PostThreadMessageW(GetCurrentThreadId(), WM_RELEASED, WPARAM(0), LPARAM(0));
-            }
+/// The key a raw keyboard message is about, and whether it came up. Nothing else in
+/// the message is read.
+unsafe fn read_key(handle: HRAWINPUT) -> Option<(u32, bool)> {
+    unsafe {
+        let mut data: RAWINPUT = std::mem::zeroed();
+        let mut size = size_of::<RAWINPUT>() as u32;
+        let got = GetRawInputData(
+            handle,
+            RID_INPUT,
+            Some((&raw mut data).cast()),
+            &mut size,
+            size_of::<RAWINPUTHEADER>() as u32,
+        );
+        if got == u32::MAX || data.header.dwType != RIM_TYPEKEYBOARD.0 {
+            return None;
         }
+        let keyboard = data.data.keyboard;
+        Some((u32::from(keyboard.VKey), keyboard.Flags & RI_KEY_BREAK != 0))
     }
-    unsafe { CallNextHookEx(None, code, wparam, lparam) }
 }
 
 // ── The microphone ────────────────────────────────────────────────────────────
@@ -405,5 +463,68 @@ fn record(
             return Err(CaptureError::Interrupted);
         }
         Ok(Recording { samples, hit_limit })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ::windows::Win32::UI::Input::KeyboardAndMouse::{
+        keybd_event, KEYBD_EVENT_FLAGS, VK_CONTROL, VK_MENU, VK_SPACE,
+    };
+    use std::sync::mpsc::channel;
+
+    fn key(vk: u16, up: bool) {
+        unsafe { keybd_event(vk as u8, 0, KEYBD_EVENT_FLAGS(if up { 2 } else { 0 }), 0) };
+    }
+
+    /// Presses real keys on the desktop, so it only runs when asked:
+    /// `cargo test -p coucou --lib holding_the_shortcut -- --ignored`
+    #[test]
+    #[ignore = "presses real keys on the desktop"]
+    fn holding_the_shortcut_and_letting_go_is_reported_in_that_order() {
+        let (tx, rx) = channel();
+        let shortcut = Shortcut::parse("Ctrl+Alt+Space").unwrap();
+        let hotkey = Hotkey::register(
+            &shortcut,
+            Arc::new(move |event| {
+                let _ = tx.send(event);
+            }),
+        )
+        .expect("the shortcut is free");
+
+        for vk in [VK_CONTROL.0, VK_MENU.0, VK_SPACE.0] {
+            key(vk, false);
+        }
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(HotkeyEvent::Pressed)
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        for vk in [VK_SPACE.0, VK_MENU.0, VK_CONTROL.0] {
+            key(vk, true);
+        }
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(HotkeyEvent::Released)
+        );
+
+        // And again: each press has its own release.
+        for vk in [VK_CONTROL.0, VK_MENU.0, VK_SPACE.0] {
+            key(vk, false);
+        }
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(HotkeyEvent::Pressed)
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        for vk in [VK_SPACE.0, VK_MENU.0, VK_CONTROL.0] {
+            key(vk, true);
+        }
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(HotkeyEvent::Released)
+        );
+        drop(hotkey);
     }
 }
