@@ -691,7 +691,6 @@ mod through_the_runtime {
             }
             Ok(reply) => Ok(rt
                 .on_reply(token, reply.text, reply.proposal)
-                .ok()
                 .expect("the turn was not stale")),
         };
         (settled, phases.into_inner().unwrap())
