@@ -171,6 +171,8 @@ export interface ActionProposal {
 export type AssistantPhase =
   | "idle"
   | "thinking"
+  /** The model asked to see the screen and the one capture of this request is being taken. */
+  | "capturing"
   | "awaiting_approval"
   | "executing"
   | "completed"

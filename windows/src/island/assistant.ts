@@ -65,6 +65,11 @@ export function registerAssistantHandlers(island: Island) {
       case "thinking":
       case "executing":
         break;
+
+      case "capturing":
+        // Part of the request, shown by the chat as "Looking at your screen…". Nothing to
+        // answer and nothing to pin: the island is already open on the chat.
+        break;
     }
     State.notify();
   });
