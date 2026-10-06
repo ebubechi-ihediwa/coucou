@@ -418,3 +418,30 @@ fn the_models_the_settings_window_offers_can_all_see() {
         assert!(model_accepts_images(offered), "{offered}");
     }
 }
+
+// ── The real screen ──────────────────────────────────────────────────────────
+
+/// Captures this computer's display, so it needs one: `cargo test -- --ignored real_screen`.
+/// Set COUCOU_SCREEN_TEST_OUT to a file name to keep the JPEG for looking at it with
+/// another decoder; without it nothing is written anywhere.
+#[test]
+#[ignore = "captures the real screen"]
+#[cfg(windows)]
+fn real_screen_is_captured_shrunk_and_encoded_within_the_limits() {
+    let started = std::time::Instant::now();
+    let shot = SystemCapture.capture(&no_cancel()).expect("the screen can be captured");
+    let took = started.elapsed();
+    let jpeg = shot.jpeg();
+    println!("captured {}x{}, {} bytes, in {:?}", shot.width, shot.height, jpeg.len(), took);
+
+    assert!(shot.width.max(shot.height) <= LIMITS.max_long_edge);
+    assert!(u64::from(shot.width) * u64::from(shot.height) <= u64::from(LIMITS.max_out_pixels));
+    assert!(jpeg.len() <= LIMITS.max_encoded_bytes);
+    assert_eq!(&jpeg[..2], &[0xFF, 0xD8], "starts as a JPEG");
+    assert_eq!(&jpeg[jpeg.len() - 2..], &[0xFF, 0xD9], "ends as a JPEG");
+    assert_eq!(dimensions(jpeg), (shot.width, shot.height));
+
+    if let Ok(out) = std::env::var("COUCOU_SCREEN_TEST_OUT") {
+        std::fs::write(out, jpeg).unwrap();
+    }
+}
