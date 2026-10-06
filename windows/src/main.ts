@@ -8,6 +8,7 @@ import { Island } from "./island/island";
 import { registerAssistantHandlers } from "./island/assistant";
 import { registerHookHandlers } from "./island/hooks";
 import { registerIntegrationHandlers, refreshConfigured } from "./island/integrations";
+import { registerVoiceHandlers } from "./island/voice";
 
 async function main() {
   const root = document.getElementById("root");
@@ -64,6 +65,7 @@ async function main() {
 
   registerHookHandlers(island);
   registerAssistantHandlers(island);
+  registerVoiceHandlers(island);
   registerIntegrationHandlers(island);
 
   island.launch();

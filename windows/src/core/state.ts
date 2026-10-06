@@ -93,6 +93,15 @@ export interface Settings {
   hooksInstalled: boolean;
   /** Claude model used by the chat. */
   model: string;
+  /** Push-to-talk: the global shortcut and the microphone behind it. */
+  voiceEnabled: boolean;
+  /** Written like "Ctrl+Alt+Space"; Rust only ever hands back a valid one. */
+  voiceShortcut: string;
+  /** Remove a leading "Hey Coucou" from what was said. */
+  wakePhraseEnabled: boolean;
+  wakePhrase: string;
+  /** Which speech-to-text service the recording is sent to. */
+  speechProvider: "openai" | "groq";
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -107,7 +116,21 @@ export const DEFAULT_SETTINGS: Settings = {
   autostart: false,
   hooksInstalled: false,
   model: "claude-opus-5",
+  voiceEnabled: true,
+  voiceShortcut: "Ctrl+Alt+Space",
+  wakePhraseEnabled: true,
+  wakePhrase: "Hey Coucou",
+  speechProvider: "openai",
 };
+
+/** Where a push-to-talk stands, as the island shows it. */
+export interface VoiceUi {
+  phase: "idle" | "listening" | "transcribing";
+  /** Said under the title: that the time limit was reached. */
+  note: string | null;
+  /** Started from the microphone button rather than the shortcut: it has no key to let go of. */
+  viaButton: boolean;
+}
 
 type Listener = () => void;
 
@@ -140,6 +163,8 @@ class AppState {
   pendingApproval: ApprovalInfo | null = null;
   /** Where the assistant stands: set from the `assistant` event Rust publishes. */
   assistant: AssistantSnapshot = { phase: "idle", proposal: null, message: null };
+  /** Push-to-talk: set from the `voice` event Rust publishes. */
+  voice: VoiceUi = { phase: "idle", note: null, viaButton: false };
 
   integrations: Record<string, IntegrationInfo> = {};
 

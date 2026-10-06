@@ -903,6 +903,16 @@ input[type="range"]::-webkit-slider-thumb {
   transform: scale(0.94);
 }
 
+/* The microphone button sits quietly next to Send. */
+.mic-btn {
+  background: rgba(255, 255, 255, 0.12);
+  color: var(--ink);
+}
+
+.mic-btn:disabled {
+  opacity: 0.35;
+}
+
 /* ── Drop zone ──────────────────────────────────────────────────────────── */
 
 .drop-card {
@@ -1102,6 +1112,14 @@ input[type="range"]::-webkit-slider-thumb {
 @keyframes pulse {
   0%, 100% { opacity: 0.2; }
   50% { opacity: 1; }
+}
+
+/* The "microphone is on" dot in the voice view: the same blink, bigger and red. It
+   adds no animation of its own, so it is paused with every other endless one. */
+.pulse.rec {
+  width: 9px;
+  height: 9px;
+  background: #f4505e;
 }
 
 .int-status {

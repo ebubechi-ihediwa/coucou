@@ -107,7 +107,44 @@ export const Bridge = {
 
   /** Tray → Pause. Stops the integration pollers, not just the island. */
   setPaused: (paused: boolean) => call<void>("set_paused", { paused }),
+
+  // ── Voice (push-to-talk) ──────────────────────────────────────────────────
+  voiceState: () => call<VoiceStatus>("voice_state"),
+  /** The microphone button: the same as holding the shortcut. */
+  voiceStart: () => callOrThrow<void>("voice_start"),
+  /** The microphone button again: the same as letting go. */
+  voiceStop: () => call<void>("voice_stop"),
+  /** Stops recording or transcribing; nothing is submitted. */
+  voiceCancel: () => call<void>("voice_cancel"),
+  /** The shortcut in its canonical spelling, or why it cannot be used. */
+  voiceCheckShortcut: (text: string) => callOrThrow<string>("voice_check_shortcut", { text }),
+  voiceCheckPhrase: (text: string) => callOrThrow<string>("voice_check_phrase", { text }),
 };
+
+/** What Rust says about push-to-talk, as the `voice` event. The page only shows it. */
+export type VoiceEvent =
+  | { phase: "idle" }
+  | { phase: "listening" }
+  | { phase: "transcribing"; limitReached: boolean }
+  | { phase: "transcript"; text: string }
+  | { phase: "notice"; message: string }
+  | { phase: "error"; message: string };
+
+export interface VoiceStatus {
+  /** False where there is no push-to-talk yet. */
+  supported: boolean;
+  enabled: boolean;
+  shortcut: string;
+  /** The chosen speech service: its id and what to call it. */
+  provider: "openai" | "groq";
+  providerLabel: string;
+  shortcutState: "off" | "ready" | "failed";
+  /** Why the shortcut could not be registered. */
+  problem: string | null;
+  /** Whether the speech-to-text key is saved. Never the key itself. */
+  hasKey: boolean;
+  phase: "idle" | "listening" | "transcribing";
+}
 
 export interface IntegrationUpdate {
   id: string;

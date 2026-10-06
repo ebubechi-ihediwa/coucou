@@ -417,6 +417,201 @@ function generalSection(): HTMLElement {
   );
 }
 
+// ── Voice section ─────────────────────────────────────────────────────────────
+
+/** "KeyA" → "A", "Digit5" → "5", "F9" → "F9", "Space" → "Space"; anything else is not a key we take. */
+function keyName(code: string): string | null {
+  if (code === "Space") return "Space";
+  const letter = /^Key([A-Z])$/.exec(code);
+  if (letter) return letter[1];
+  const digit = /^Digit([0-9])$/.exec(code);
+  if (digit) return digit[1];
+  if (/^F([1-9]|1[0-9]|2[0-4])$/.test(code)) return code;
+  return null;
+}
+
+/** The speech services a recording can be sent to: their names, Credential Manager entries, and what a key looks like. */
+const SPEECH_SERVICES: Record<string, { label: string; key: string; placeholder: string }> = {
+  openai: { label: "OpenAI", key: "openai-api-key", placeholder: "sk-…" },
+  groq: { label: "Groq", key: "groq-api-key", placeholder: "gsk_…" },
+};
+const speechService = () => SPEECH_SERVICES[settings.speechProvider] ?? SPEECH_SERVICES.openai;
+
+function voiceSection(hasKey: boolean): HTMLElement {
+  const dot = statusDot(false);
+  const status = h("span", { class: "hint" });
+  const feedback = h("div", {});
+  const keyState = h("span", { class: "hint" });
+
+  // ── Shortcut: press the keys you want
+  const shortcutBtn = h("button", { text: settings.voiceShortcut, style: "min-width:150px" });
+  let capturing = false;
+  const stopCapture = () => {
+    capturing = false;
+    shortcutBtn.textContent = settings.voiceShortcut;
+    shortcutBtn.classList.remove("primary");
+  };
+  shortcutBtn.addEventListener("click", () => {
+    capturing = true;
+    clear(feedback);
+    shortcutBtn.textContent = "Press the keys… (Esc cancels)";
+    shortcutBtn.classList.add("primary");
+  });
+  shortcutBtn.addEventListener("blur", () => capturing && stopCapture());
+  window.addEventListener(
+    "keydown",
+    async (e) => {
+      if (!capturing) return;
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.key === "Escape") return stopCapture();
+      const key = keyName(e.code);
+      if (!key) return; // a modifier on its own, or a key we do not take: keep waiting
+      const text = [e.ctrlKey && "Ctrl", e.altKey && "Alt", e.shiftKey && "Shift", e.metaKey && "Win", key]
+        .filter(Boolean)
+        .join("+");
+      stopCapture();
+      clear(feedback);
+      try {
+        // Rust decides what counts as a usable shortcut.
+        settings.voiceShortcut = await Bridge.voiceCheckShortcut(text);
+        shortcutBtn.textContent = settings.voiceShortcut;
+        await save();
+        await refresh();
+      } catch (err) {
+        feedback.append(h("div", { class: "notice err", text: String(err).replace(/^Error:\s*/, "") }));
+      }
+    },
+    true,
+  );
+
+  // ── Wake phrase
+  const phrase = h("input", {
+    type: "text",
+    value: settings.wakePhrase,
+    style: "flex:1 1 auto;min-width:0",
+    spellcheck: "false",
+    maxlength: "40",
+  }) as HTMLInputElement;
+  phrase.addEventListener("change", async () => {
+    clear(feedback);
+    try {
+      settings.wakePhrase = await Bridge.voiceCheckPhrase(phrase.value);
+      phrase.value = settings.wakePhrase;
+      await save();
+    } catch (err) {
+      phrase.value = settings.wakePhrase;
+      feedback.append(h("div", { class: "notice err", text: String(err).replace(/^Error:\s*/, "") }));
+    }
+  });
+
+  // ── The speech service and its key
+  const service = h("select", {}) as HTMLSelectElement;
+  for (const [id, def] of Object.entries(SPEECH_SERVICES)) {
+    service.append(h("option", { value: id, text: def.label }));
+  }
+  service.value = settings.speechProvider;
+
+  const keyLabel = h("label", {});
+  const field = h("input", {
+    type: "password",
+    style: "flex:1 1 auto;min-width:0",
+    autocomplete: "off",
+    spellcheck: "false",
+  }) as HTMLInputElement;
+  const saveBtn = h("button", { class: "primary", text: "Save key" });
+  const clearBtn = h("button", { class: "danger", text: "Remove" });
+  const audioNote = h("div", { class: "hint" });
+  let keyPresent = hasKey;
+
+  /** What depends on the chosen service: names, placeholder, the note about where audio goes. */
+  function labels() {
+    const def = speechService();
+    keyLabel.textContent = `${def.label} key`;
+    field.placeholder = keyPresent ? "••••••••••••  (stored)" : def.placeholder;
+    clearBtn.style.display = keyPresent ? "" : "none";
+    audioNote.textContent = `Audio is recorded only while you hold the shortcut (45 seconds at most), sent to ${def.label} to be turned into text, and never saved.`;
+  }
+
+  async function refresh() {
+    const s = await Bridge.voiceState();
+    if (!s) return;
+    keyPresent = s.hasKey;
+    dot.style.background = s.supported && s.enabled && s.shortcutState === "ready" && s.hasKey ? "#22c55e" : "#f4505e";
+    if (!s.supported) status.textContent = "Push-to-talk isn't available on this system yet.";
+    else if (!s.enabled) status.textContent = "Voice is off. The shortcut is not registered and the microphone is never used.";
+    else if (s.shortcutState === "failed") status.textContent = `${s.problem ?? "The shortcut could not be registered."} (${s.shortcut})`;
+    else if (!s.hasKey) status.textContent = `Hold ${s.shortcut} to talk once a ${s.providerLabel} key is saved below.`;
+    else status.textContent = `Hold ${s.shortcut} anywhere to talk. Let go to send.`;
+    keyState.textContent = s.hasKey
+      ? "Key saved in the Windows Credential Manager."
+      : `No ${s.providerLabel} key yet: voice needs one.`;
+    labels();
+  }
+
+  service.addEventListener("change", async () => {
+    clear(feedback);
+    settings.speechProvider = service.value as Settings["speechProvider"];
+    field.value = "";
+    await save();
+    await refresh();
+  });
+
+  saveBtn.addEventListener("click", async () => {
+    const value = field.value.trim();
+    if (!value) return;
+    clear(feedback);
+    try {
+      await Bridge.secretSet(speechService().key, value);
+      field.value = "";
+      feedback.append(h("div", { class: "notice ok", text: "Saved. It never touches disk." }));
+      await refresh();
+    } catch (err) {
+      feedback.append(h("div", { class: "notice err", text: `Could not save: ${String(err)}` }));
+    }
+  });
+  clearBtn.addEventListener("click", async () => {
+    clear(feedback);
+    try {
+      await Bridge.secretClear(speechService().key);
+      feedback.append(h("div", { class: "notice ok", text: "Key removed." }));
+      await refresh();
+    } catch (err) {
+      feedback.append(h("div", { class: "notice err", text: `Could not remove: ${String(err)}` }));
+    }
+  });
+
+  labels();
+  void onEvent("voice-status", () => void refresh());
+  void refresh();
+
+  return h(
+    "section",
+    {},
+    h("h2", {}, dot, h("span", { text: "Voice" })),
+    status,
+    h("div", { class: "row" },
+      h("label", { text: "Push-to-talk" }),
+      toggle(settings.voiceEnabled, (v) => {
+        settings.voiceEnabled = v;
+        void save().then(refresh);
+      }),
+    ),
+    h("div", { class: "row" }, h("label", { text: "Shortcut" }), shortcutBtn),
+    h("div", { class: "row" },
+      h("label", { text: "Leading phrase" }),
+      toggle(settings.wakePhraseEnabled, (v) => { settings.wakePhraseEnabled = v; void save(); }),
+      phrase,
+    ),
+    h("div", { class: "hint", text: "If a request starts with this phrase it is removed. It is not listened for: the microphone only opens while you hold the shortcut." }),
+    h("div", { class: "row" }, h("label", { text: "Speech service" }), service),
+    h("div", { class: "row" }, keyLabel, field, saveBtn, clearBtn),
+    keyState,
+    feedback,
+    audioNote,
+  );
+}
+
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -430,6 +625,7 @@ async function main() {
   };
 
   const hasKey = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
+  const hasVoiceKey = (await Bridge.secretPresent(speechService().key)) ?? false;
 
   const keys = [
     "stripe-api-key", "github-token", "vercel-token",
@@ -443,6 +639,7 @@ async function main() {
     h("h1", {}, h("span", { text: "Coucou" }), h("span", { class: "version", text: version })),
     claudeSection(status),
     apiSection(hasKey),
+    voiceSection(hasVoiceKey),
     integrationsSection(present),
     generalSection(),
     h("div", {

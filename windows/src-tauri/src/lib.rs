@@ -17,6 +17,7 @@ mod platform;
 mod secrets;
 mod settings;
 mod tray;
+mod voice;
 
 use std::process::Command;
 use std::sync::atomic::Ordering;
@@ -69,12 +70,18 @@ fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
 fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
     // Whatever the page sent is held to the same rules as a settings file.
     let settings = settings::sanitized(settings);
-    let (screen_changed, autostart_changed) = {
+    let (screen_changed, autostart_changed, shortcut_changed, voice_changed) = {
         let mut current = shared.settings.lock().unwrap();
         let screen_changed = current.screen != settings.screen;
         let autostart_changed = current.autostart != settings.autostart;
+        let shortcut_changed =
+            current.voice_enabled != settings.voice_enabled || current.voice_shortcut != settings.voice_shortcut;
+        let voice_changed = shortcut_changed
+            || current.wake_phrase_enabled != settings.wake_phrase_enabled
+            || current.wake_phrase != settings.wake_phrase
+            || current.speech_provider != settings.speech_provider;
         *current = settings.clone();
-        (screen_changed, autostart_changed)
+        (screen_changed, autostart_changed, shortcut_changed, voice_changed)
     };
     // The log, not stderr: there is no console to read it from.
     settings::save_or_log(&settings);
@@ -88,6 +95,9 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
     if screen_changed {
         let collapsed = shared.gate.collapsed.load(Ordering::Relaxed);
         island::apply_geometry(&app, &settings.screen, collapsed);
+    }
+    if voice_changed {
+        apply_voice(&app, shortcut_changed);
     }
     // Keep the other window in step (island ⇄ settings window).
     let _ = app.emit("settings-changed", settings);
@@ -442,6 +452,250 @@ fn log_line(message: String) {
     log::line(format!("ui  {message}"));
 }
 
+// ── Voice ─────────────────────────────────────────────────────────────────────
+
+/// Everything push-to-talk needs from the app, in one place: the controller, the
+/// registered shortcut, and where the registration stands.
+pub struct VoiceHub {
+    voice: Arc<voice::Voice>,
+    hotkey: Mutex<Option<platform::voice::Hotkey>>,
+    shortcut: Mutex<ShortcutStatus>,
+    /// The shortcut thread hands its events to one consumer, so a press and the
+    /// release after it are always handled in that order.
+    events: std::sync::mpsc::Sender<voice::HotkeyEvent>,
+}
+
+#[derive(Clone, PartialEq)]
+enum ShortcutStatus {
+    /// Voice is switched off: no shortcut is registered.
+    Off,
+    Ready,
+    Failed(String),
+}
+
+/// What the page is told about voice, for the settings window and the mic button.
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceStatus {
+    /// False where there is no push-to-talk yet (Linux).
+    supported: bool,
+    enabled: bool,
+    shortcut: String,
+    /// "off", "ready" or "failed".
+    shortcut_state: &'static str,
+    /// Why the shortcut could not be registered.
+    problem: Option<String>,
+    /// Which speech service is chosen ("openai" or "groq") and what to call it.
+    provider: &'static str,
+    provider_label: &'static str,
+    /// Whether that service's key is saved (never its value).
+    has_key: bool,
+    phase: voice::Phase,
+}
+
+/// Carries what the controller says to the island.
+struct IslandSink {
+    app: AppHandle,
+}
+
+impl voice::Sink for IslandSink {
+    fn publish(&self, event: voice::Event) {
+        // What was said is the person's own and stays out of the log: only that
+        // something happened, and how long it was.
+        log::line(match &event {
+            voice::Event::Idle => "voice: cancelled".to_string(),
+            voice::Event::Listening => "voice: listening".to_string(),
+            voice::Event::Transcribing { limit_reached } => {
+                format!("voice: transcribing (time limit reached: {limit_reached})")
+            }
+            voice::Event::Transcript { text } => format!("voice: transcript of {} characters", text.chars().count()),
+            voice::Event::Notice { message } | voice::Event::Error { message } => format!("voice: {message}"),
+        });
+        let _ = self.app.emit_to(island::WINDOW_LABEL, "voice", &event);
+    }
+}
+
+impl VoiceHub {
+    fn new(app: &AppHandle, settings: &Settings) -> VoiceHub {
+        let (events, incoming) = std::sync::mpsc::channel();
+        let gate_app = app.clone();
+        let voice = voice::Voice::new(
+            Box::new(platform::voice::Microphone::default()),
+            Arc::new(voice::transcribe::Speech),
+            Arc::new(IslandSink { app: app.clone() }),
+            Box::new(move || voice_gate(&gate_app)),
+            voice_config(settings),
+        );
+        // One thread, asleep until the OS reports the shortcut. Not a poll.
+        let worker = voice.clone();
+        let spawned = std::thread::Builder::new().name("coucou-voice".into()).spawn(move || {
+            // A release ends the push its own press started, and no other: tapping the
+            // shortcut while a push begun with the button is running must not stop that
+            // one, and a late release must not stop a newer push.
+            let mut started: Option<u64> = None;
+            for event in incoming {
+                match event {
+                    voice::HotkeyEvent::Pressed => started = worker.begin().ok(),
+                    voice::HotkeyEvent::Released => {
+                        if let Some(session) = started.take() {
+                            worker.end_session(session);
+                        }
+                    }
+                }
+            }
+        });
+        if spawned.is_err() {
+            log::line("voice: could not start its thread");
+        }
+        VoiceHub {
+            voice,
+            hotkey: Mutex::new(None),
+            shortcut: Mutex::new(ShortcutStatus::Off),
+            events,
+        }
+    }
+}
+
+/// The speech service the settings name. Settings validation keeps it one of the two the
+/// app knows, so the fallback is only for a value that never went through it.
+fn voice_provider(settings: &Settings) -> voice::transcribe::Provider {
+    voice::transcribe::Provider::from_id(&settings.speech_provider)
+        .unwrap_or(voice::transcribe::DEFAULT_PROVIDER)
+}
+
+fn voice_config(settings: &Settings) -> voice::Config {
+    voice::Config::new(settings.voice_enabled, settings.wake_phrase_enabled, settings.wake_phrase.clone())
+        .with_provider(voice_provider(settings))
+}
+
+/// A push may not start while the assistant is busy (a typed message is refused the
+/// same way), while Coucou is paused, or with no key for the speech service. Said
+/// before the microphone is touched.
+fn voice_gate(app: &AppHandle) -> Option<String> {
+    use assistant::Phase;
+    if matches!(app.state::<Assistant>().snapshot().phase, Phase::Thinking | Phase::Executing) {
+        return Some(voice::STILL_WORKING.to_string());
+    }
+    if integrations::PAUSED.load(Ordering::Relaxed) {
+        return Some("Coucou is paused.".to_string());
+    }
+    let provider = voice_provider(&app.state::<Shared>().settings.lock().unwrap());
+    if !secrets::present(provider.key_name()) {
+        return Some(provider.no_key_message());
+    }
+    None
+}
+
+/// Makes the controller and the registered shortcut match the settings. Turning voice
+/// off unregisters the shortcut, which is what makes the microphone unreachable.
+fn apply_voice(app: &AppHandle, reregister: bool) {
+    let hub = app.state::<VoiceHub>();
+    let settings = app.state::<Shared>().settings.lock().unwrap().clone();
+    hub.voice.configure(voice_config(&settings));
+    if !reregister {
+        return;
+    }
+    // Dropped outside the lock: ending the shortcut's thread must not wait on it.
+    let old = hub.hotkey.lock().unwrap().take();
+    drop(old);
+
+    let status = if !settings.voice_enabled {
+        ShortcutStatus::Off
+    } else {
+        match voice::shortcut::Shortcut::parse(&settings.voice_shortcut) {
+            Err(why) => ShortcutStatus::Failed(why.message().to_string()),
+            Ok(shortcut) => {
+                let events = hub.events.clone();
+                let on_event: Arc<dyn Fn(voice::HotkeyEvent) + Send + Sync> = Arc::new(move |event| {
+                    let _ = events.send(event);
+                });
+                match platform::voice::Hotkey::register(&shortcut, on_event) {
+                    Ok(hotkey) => {
+                        *hub.hotkey.lock().unwrap() = Some(hotkey);
+                        ShortcutStatus::Ready
+                    }
+                    Err(why) => ShortcutStatus::Failed(why.message().to_string()),
+                }
+            }
+        }
+    };
+    log::line(match &status {
+        ShortcutStatus::Off => "voice: off, no shortcut registered".to_string(),
+        ShortcutStatus::Ready => format!("voice: shortcut {} registered", settings.voice_shortcut),
+        ShortcutStatus::Failed(why) => format!("voice: shortcut {} not registered: {why}", settings.voice_shortcut),
+    });
+    *hub.shortcut.lock().unwrap() = status;
+    let _ = app.emit("voice-status", voice_status(app));
+}
+
+fn voice_status(app: &AppHandle) -> VoiceStatus {
+    let settings = app.state::<Shared>().settings.lock().unwrap().clone();
+    let provider = voice_provider(&settings);
+    // A page can ask before setup has made the hub; it then simply sees "off".
+    let hub = app.try_state::<VoiceHub>();
+    let (shortcut_state, problem) = match hub.as_ref().map(|h| h.shortcut.lock().unwrap().clone()) {
+        Some(ShortcutStatus::Ready) => ("ready", None),
+        Some(ShortcutStatus::Failed(why)) => ("failed", Some(why)),
+        Some(ShortcutStatus::Off) | None => ("off", None),
+    };
+    VoiceStatus {
+        supported: platform::voice::SUPPORTED,
+        enabled: settings.voice_enabled,
+        shortcut: settings.voice_shortcut,
+        shortcut_state,
+        problem,
+        provider: provider.id(),
+        provider_label: provider.label(),
+        has_key: secrets::present(provider.key_name()),
+        phase: hub.map_or(voice::Phase::Idle, |h| h.voice.phase()),
+    }
+}
+
+#[tauri::command]
+fn voice_state(app: AppHandle) -> VoiceStatus {
+    voice_status(&app)
+}
+
+/// The microphone button. Starts a push exactly like the shortcut does; the second
+/// press of the button (`voice_stop`) is the release.
+#[tauri::command]
+fn voice_start(hub: State<VoiceHub>) -> Result<(), String> {
+    match hub.voice.begin() {
+        Err(voice::Refused::Disabled) => Err("Voice is off. Turn it on in Settings.".into()),
+        // Anything else has already been said to the island.
+        _ => Ok(()),
+    }
+}
+
+/// For the settings window: the shortcut in its canonical spelling, or the reason it
+/// cannot be one. Nothing is registered here.
+#[tauri::command]
+fn voice_check_shortcut(text: String) -> Result<String, String> {
+    voice::shortcut::Shortcut::parse(&text)
+        .map(|shortcut| shortcut.to_string())
+        .map_err(|why| why.message().to_string())
+}
+
+#[tauri::command]
+fn voice_check_phrase(text: String) -> Result<String, String> {
+    let phrase = text.trim();
+    if voice::wake::valid_phrase(phrase) {
+        Ok(phrase.to_string())
+    } else {
+        Err("Use letters and spaces, up to 40 characters.".to_string())
+    }
+}
+
+#[tauri::command]
+fn voice_stop(hub: State<VoiceHub>) {
+    hub.voice.end();
+}
+
+#[tauri::command]
+fn voice_cancel(hub: State<VoiceHub>) {
+    hub.voice.cancel();
+}
+
 // ── Settings window ───────────────────────────────────────────────────────────
 
 /// WebView2 allows exactly one browser environment per app, and its options are
@@ -570,9 +824,16 @@ pub fn run() {
             open_n8n,
             open_settings_window,
             set_paused,
+            voice_state,
+            voice_start,
+            voice_stop,
+            voice_cancel,
+            voice_check_shortcut,
+            voice_check_phrase,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
+            app.manage(VoiceHub::new(&handle, &loaded));
             tray::build(&handle)?;
             // Before the island: see create_settings_window.
             create_settings_window(&handle);
@@ -595,8 +856,18 @@ pub fn run() {
             hooks::ensure_hook_exe(&handle);
             pipe::start(handle.clone());
             integrations::start(handle.clone());
+            apply_voice(&handle, true);
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Coucou");
+        .build(tauri::generate_context!())
+        .expect("error while building Coucou")
+        .run(|app, event| {
+            // Whatever is happening, the microphone is closed before the process goes.
+            if let tauri::RunEvent::Exit = event {
+                let hub = app.state::<VoiceHub>();
+                hub.voice.shutdown();
+                let hotkey = hub.hotkey.lock().unwrap().take();
+                drop(hotkey);
+            }
+        });
 }
