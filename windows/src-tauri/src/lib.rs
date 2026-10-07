@@ -296,6 +296,9 @@ async fn chat_send(
         .map_err(|_| "Coucou is still working on your last request.".to_string())?;
     assistant::settle(&chat, superseded);
     publish(&app, &assistant.snapshot());
+    // Typed or spoken, a request is one turn; the log says when one starts and how it
+    // ends, never what was said or seen.
+    log::line("assistant: request started");
 
     // The request runs as a task of its own so that cancelling can end it. If it
     // is ended, its sender goes with it and the wait below returns an error.
@@ -326,13 +329,17 @@ async fn chat_send(
     });
     assistant.attach_abort(token, move || task.abort());
 
-    let cancelled = || ChatReply { text: String::new(), proposal: None, cancelled: true };
+    let cancelled = || {
+        log::line("assistant: request ended (cancelled)");
+        ChatReply { text: String::new(), proposal: None, cancelled: true }
+    };
     let Ok(reply) = rx.await else { return Ok(cancelled()) };
     let reply = match reply {
         Ok(reply) => reply,
         Err(message) => {
             assistant.fail_turn(token, message.clone());
             publish(&app, &assistant.snapshot());
+            log::line("assistant: request ended (failed)");
             return Err(message);
         }
     };
@@ -361,10 +368,12 @@ async fn chat_send(
             let (snapshot, result) = assistant.finish(proposal.id, outcome);
             assistant::settle(&chat, result);
             publish(&app, &snapshot);
+            log::line("assistant: request ended (answered, action done)");
             return Ok(ChatReply { text, proposal: None, cancelled: false });
         }
     };
     publish(&app, &assistant.snapshot());
+    log::line(if proposal.is_some() { "assistant: request ended (action proposed)" } else { "assistant: request ended (answered)" });
     Ok(ChatReply { text, proposal, cancelled: false })
 }
 
