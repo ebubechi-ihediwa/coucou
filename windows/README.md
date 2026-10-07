@@ -275,6 +275,47 @@ is skipped by default: `cargo test -p coucou --lib real_screen -- --ignored --no
 (add `--release` to see the real speed; it writes nothing unless
 `COUCOU_SCREEN_TEST_OUT` names a file).
 
+### Listen, see and act
+
+The three work together in one request, spoken or typed: "Hey Coucou, look at this error
+and open the documentation for it."
+
+```
+hold the shortcut ─► Listening… ─► Transcribing… ─► Thinking… ─► Looking at your screen…
+   ─► Thinking… ─► [ Allow · Open docs.python.org ] ─► you press Allow ─► Opened docs.python.org.
+```
+
+There is still one assistant. A spoken request is only text by the time it reaches it, so
+it goes through the same turn as a typed one, and the model uses only what the request
+needs: "what is 2 + 2?" takes no screenshot and proposes nothing, "open Notepad" proposes
+an action and takes no screenshot, "what am I looking at?" takes one screenshot and
+proposes nothing, and a request that wants both looks first and then proposes. Not every
+request uses every capability, and nothing runs in a loop: a request is at most one
+screenshot, then the answer or one proposed action.
+
+What each part may and may not do stays exactly as described above:
+
+- **Speaking is not approving.** What you said, and what the model saw, only ever lead to
+  a proposal. The card shows the exact action (for a link, the whole address) and nothing
+  happens until you press **Allow**. Saying "yes" or "go ahead" is a new request, not an
+  answer to the card: it withdraws the card and the model is told the action was not done.
+- **The screen is information, not instruction.** Text on the screen or in a page can't
+  grant permission, change a setting, widen the capture or start anything. If the model
+  proposes something because a page told it to, the proposal still has to be one of the
+  three closed kinds (a listed application, an `http(s)` link, a file you attached) and
+  still waits for your Allow; a command line, an executable, a `file:` or `javascript:`
+  link or an address with a password is refused before you are asked.
+- **One request, one set of state.** The screenshot, the transcript and the proposal belong
+  to the request that made them. A screenshot is never kept or resent, a card from an
+  earlier request can't be approved by a later one, and Stop (at the microphone, the
+  transcription, the model, the capture or the card) leaves nothing behind, so the next
+  request starts clean.
+- **Nothing runs while idle.** The microphone opens only while you hold the shortcut and
+  the screen is read only inside a request.
+
+A spoken request that arrives while another is still running is not queued: Mochi says so
+and drops it.
+
 ### Idle resource use
 
 The island must cost nothing while hidden. [PERFORMANCE.md](PERFORMANCE.md) lists what

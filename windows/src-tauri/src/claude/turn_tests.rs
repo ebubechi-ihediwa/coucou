@@ -55,6 +55,8 @@ struct Fake {
     cancels: Mutex<Vec<Arc<AtomicBool>>>,
     /// The capture never finishes, as when it is stopped part-way.
     hangs: bool,
+    /// The model never answers, as when it is stopped while it is thinking.
+    hangs_ask: bool,
 }
 
 impl Fake {
@@ -69,6 +71,7 @@ impl Fake {
             looks: AtomicUsize::new(0),
             cancels: Mutex::new(Vec::new()),
             hangs: false,
+            hangs_ask: false,
         }
     }
 
@@ -88,6 +91,9 @@ impl Fake {
 impl Backend for Fake {
     fn ask(&self, body: Value) -> BoxFuture<'_, Result<Value, String>> {
         self.bodies.lock().unwrap().push(body);
+        if self.hangs_ask {
+            return Box::pin(std::future::pending());
+        }
         let next = self
             .replies
             .lock()
@@ -608,6 +614,8 @@ fn nothing_from_the_picture_reaches_the_log_an_error_or_the_debug_output() {
 
 // ── Through the assistant's runtime, as `chat_send` drives it ────────────────
 
+mod multimodal;
+
 mod through_the_runtime {
     use super::*;
     use crate::actions::PolicyConfig;
@@ -618,10 +626,10 @@ mod through_the_runtime {
 
     /// Records what the system was asked to open; opens nothing.
     #[derive(Default)]
-    struct Recorder(Mutex<Vec<String>>);
+    pub(super) struct Recorder(Mutex<Vec<String>>);
 
     impl Recorder {
-        fn calls(&self) -> Vec<String> {
+        pub(super) fn calls(&self) -> Vec<String> {
             self.0.lock().unwrap().clone()
         }
     }
@@ -644,7 +652,7 @@ mod through_the_runtime {
         }
     }
 
-    fn runtime() -> (Runtime<&'static Recorder>, &'static Recorder) {
+    pub(super) fn runtime() -> (Runtime<&'static Recorder>, &'static Recorder) {
         static N: AtomicUsize = AtomicUsize::new(0);
         let recorder: &'static Recorder = Box::leak(Box::default());
         let root = std::env::temp_dir().join(format!(
@@ -661,7 +669,7 @@ mod through_the_runtime {
 
     /// One request as `chat_send` runs it: begin, say each stage, ask, settle. Also the
     /// phase the island would have been shown at each stage.
-    fn drive(
+    pub(super) fn drive(
         rt: &Runtime<&'static Recorder>,
         chat: &Chat,
         fake: &Fake,
@@ -696,7 +704,7 @@ mod through_the_runtime {
         (settled, phases.into_inner().unwrap())
     }
 
-    fn words(settled: Result<Settled, String>) -> String {
+    pub(super) fn words(settled: Result<Settled, String>) -> String {
         match settled {
             Ok(Settled::Reply { text }) => text,
             other => panic!("expected a plain reply, got {other:?}"),
