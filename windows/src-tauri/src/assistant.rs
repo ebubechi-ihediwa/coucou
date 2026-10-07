@@ -1,8 +1,10 @@
 // The assistant's turn, as an explicit state machine.
 //
 //   idle ──► thinking ──► awaiting_approval ──► executing ──► completed
-//              │               │                    │    └──► failed
-//              │               └──► cancelled       └───────► cancelled
+//              │   ▲  │           │                    │    └──► failed
+//              │   │  │           └──► cancelled       └───────► cancelled
+//              │   └ capturing    (the model asked to see the screen: one capture, then
+//              │                   back to thinking)
 //              └──► failed / cancelled
 //
 // A request is sent to the model (`thinking`). If the model proposes an action it is
@@ -27,7 +29,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::actions::{self, Action, ActionView, PolicyConfig, Verdict};
-use crate::claude::Chat;
+use crate::claude::{Chat, Stage};
 use crate::executor::{Executor, Files, Launcher, Outcome};
 
 // ── Data crossing the boundaries ──────────────────────────────────────────────
@@ -59,6 +61,9 @@ pub fn settle(chat: &Chat, result: Option<ToolResult>) {
 pub enum Phase {
     Idle,
     Thinking,
+    /// The model asked to see the screen and the one capture of this request is being
+    /// taken. It is part of the request: busy, and cancellable, like thinking.
+    Capturing,
     AwaitingApproval,
     Executing,
     Completed,
@@ -210,7 +215,7 @@ impl<L: Launcher> Runtime<L> {
         let mut s = self.state.lock().unwrap();
         let mut superseded = None;
         match s.phase {
-            Phase::Thinking | Phase::Executing => return Err(Busy),
+            Phase::Thinking | Phase::Capturing | Phase::Executing => return Err(Busy),
             Phase::AwaitingApproval => {
                 superseded = s.pending.take().map(|p| ToolResult {
                     tool_use_id: p.tool_use_id,
@@ -231,7 +236,7 @@ impl<L: Launcher> Runtime<L> {
     /// by the time this is called, the request is stopped at once.
     pub fn attach_abort(&self, token: TurnToken, abort: impl FnOnce() + Send + 'static) {
         let mut s = self.state.lock().unwrap();
-        if s.turn == token.0 && s.phase == Phase::Thinking {
+        if s.turn == token.0 && matches!(s.phase, Phase::Thinking | Phase::Capturing) {
             s.abort = Some(Box::new(abort));
         } else {
             drop(s);
@@ -248,7 +253,7 @@ impl<L: Launcher> Runtime<L> {
         proposal: Option<RawProposal>,
     ) -> Result<Settled, Stale> {
         let mut s = self.state.lock().unwrap();
-        if s.turn != token.0 || s.phase != Phase::Thinking {
+        if s.turn != token.0 || !matches!(s.phase, Phase::Thinking | Phase::Capturing) {
             return Err(Stale);
         }
         s.abort = None;
@@ -325,11 +330,29 @@ impl<L: Launcher> Runtime<L> {
     /// The request itself failed (network, key, rate limit). thinking → failed.
     pub fn fail_turn(&self, token: TurnToken, message: String) {
         let mut s = self.state.lock().unwrap();
-        if s.turn == token.0 && s.phase == Phase::Thinking {
+        if s.turn == token.0 && matches!(s.phase, Phase::Thinking | Phase::Capturing) {
             s.phase = Phase::Failed;
             s.message = Some(message);
             s.abort = None;
         }
+    }
+
+    /// The turn moves between asking the model and looking at the screen. Only the
+    /// turn in progress can say so: a stage change for a cancelled turn is ignored.
+    /// Returns whether anything changed, so the island is told only when it did.
+    pub fn set_stage(&self, token: TurnToken, stage: Stage) -> bool {
+        let mut s = self.state.lock().unwrap();
+        if s.turn != token.0 || !matches!(s.phase, Phase::Thinking | Phase::Capturing) {
+            return false;
+        }
+        let (phase, message) = match stage {
+            Stage::Capturing => (Phase::Capturing, Some("Looking at your screen…".to_string())),
+            Stage::Thinking => (Phase::Thinking, None),
+        };
+        let changed = s.phase != phase;
+        s.phase = phase;
+        s.message = message;
+        changed
     }
 
     /// awaiting_approval → executing. Only the proposal currently shown, only once.
@@ -415,7 +438,7 @@ impl<L: Launcher> Runtime<L> {
         let mut result = None;
         let mut abort = None;
         match s.phase {
-            Phase::Thinking => {
+            Phase::Thinking | Phase::Capturing => {
                 s.phase = Phase::Cancelled;
                 s.message = Some("Cancelled.".into());
                 abort = s.abort.take();
@@ -1307,6 +1330,93 @@ mod tests {
         assert!(
             text.contains("could not be done") && !text.contains("private"),
             "{text}"
+        );
+    }
+
+    // ── Looking at the screen ────────────────────────────────────────────────
+
+    #[test]
+    fn looking_at_the_screen_is_part_of_the_request_busy_and_then_back_to_thinking() {
+        let (rt, _) = runtime();
+        let (token, _) = rt.begin_turn().unwrap();
+        assert!(rt.set_stage(token, Stage::Capturing), "that was a change");
+        let snapshot = rt.snapshot();
+        assert_eq!(snapshot.phase, Phase::Capturing);
+        assert_eq!(snapshot.message.as_deref(), Some("Looking at your screen…"));
+        assert_eq!(rt.begin_turn().err(), Some(Busy), "no second request while looking");
+        assert!(!rt.set_stage(token, Stage::Capturing), "saying it twice changes nothing");
+
+        assert!(rt.set_stage(token, Stage::Thinking));
+        assert_eq!(rt.snapshot(), Snapshot { phase: Phase::Thinking, proposal: None, message: None });
+        assert!(matches!(rt.on_reply(token, "It is a terminal.".into(), None), Ok(Settled::Reply { .. })));
+        assert_eq!(rt.snapshot().phase, Phase::Idle);
+    }
+
+    #[test]
+    fn a_reply_or_a_failure_can_arrive_while_the_phase_is_still_capturing() {
+        let (rt, _) = runtime();
+        let (token, _) = rt.begin_turn().unwrap();
+        rt.set_stage(token, Stage::Capturing);
+        rt.fail_turn(token, "The screen could not be captured.".into());
+        assert_eq!(rt.snapshot().phase, Phase::Failed);
+
+        let (token, _) = rt.begin_turn().unwrap();
+        rt.set_stage(token, Stage::Capturing);
+        assert!(rt.on_reply(token, "Done.".into(), None).is_ok());
+        assert_eq!(rt.snapshot().phase, Phase::Idle);
+    }
+
+    #[test]
+    fn stop_while_looking_cancels_the_request_and_a_late_stage_or_reply_is_ignored() {
+        let (rt, _) = runtime();
+        let (token, _) = rt.begin_turn().unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let flag = stopped.clone();
+        rt.attach_abort(token, move || flag.store(true, Ordering::SeqCst));
+        rt.set_stage(token, Stage::Capturing);
+
+        let report = rt.cancel();
+        assert_eq!(report.snapshot.phase, Phase::Cancelled);
+        assert!(stopped.load(Ordering::SeqCst), "the request in flight was ended");
+
+        // Whatever the stopped turn still says, or answers, is dropped.
+        assert!(!rt.set_stage(token, Stage::Thinking));
+        assert_eq!(rt.snapshot().phase, Phase::Cancelled);
+        assert_eq!(rt.on_reply(token, "late".into(), notepad()).err(), Some(Stale));
+        assert_eq!(rt.snapshot().phase, Phase::Cancelled, "a proposal does not come back after Stop");
+
+        // The next message works.
+        assert!(rt.begin_turn().is_ok());
+    }
+
+    #[test]
+    fn a_stage_from_an_old_turn_cannot_move_a_newer_one() {
+        let (rt, _) = runtime();
+        let (old, _) = rt.begin_turn().unwrap();
+        rt.cancel();
+        let (_new, _) = rt.begin_turn().unwrap();
+        assert!(!rt.set_stage(old, Stage::Capturing));
+        assert_eq!(rt.snapshot().phase, Phase::Thinking);
+    }
+
+    #[test]
+    fn a_stage_does_nothing_outside_a_request() {
+        let (rt, _) = runtime();
+        let (token, _) = rt.begin_turn().unwrap();
+        let shown = proposed(rt.on_reply(token, String::new(), notepad()));
+        assert!(!rt.set_stage(token, Stage::Capturing), "not while a proposal waits");
+        assert_eq!(rt.snapshot().phase, Phase::AwaitingApproval);
+        assert!(rt.approve(shown.id).is_ok());
+    }
+
+    #[test]
+    fn the_capturing_phase_serialises_for_the_island() {
+        let (rt, _) = runtime();
+        let (token, _) = rt.begin_turn().unwrap();
+        rt.set_stage(token, Stage::Capturing);
+        assert_eq!(
+            serde_json::to_value(rt.snapshot()).unwrap(),
+            json!({ "phase": "capturing", "proposal": null, "message": "Looking at your screen…" })
         );
     }
 

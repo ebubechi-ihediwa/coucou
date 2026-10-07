@@ -32,11 +32,20 @@ function bubble(message: ChatMessage): HTMLElement {
   return h("div", { class: "chat-row" }, h("div", { class: "reply", text: message.content }));
 }
 
-function typingDots(): HTMLElement {
+function typingDots(label?: string): HTMLElement {
   return h(
     "div",
     { class: "chat-row" },
-    h("div", { class: "typing" }, h("i"), h("i"), h("i")),
+    h(
+      "div",
+      { class: "typing" },
+      h("i"),
+      h("i"),
+      h("i"),
+      label
+        ? h("span", { text: label, style: "margin-left:8px;font:400 11.5px var(--font);color:var(--dim-2)" })
+        : null,
+    ),
   );
 }
 
@@ -160,12 +169,14 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
       }
 
       const thinking = State.stateOverride === "thinking";
-      const count = State.chatHistory.length + (thinking ? 0.5 : 0);
+      // While the model's one look at the screen is being taken, the dots say so.
+      const looking = thinking && State.assistant.phase === "capturing";
+      const count = State.chatHistory.length + (thinking ? 0.5 : 0) + (looking ? 0.25 : 0);
       if (count !== renderedCount) {
         renderedCount = count;
         clear(log);
         for (const m of State.chatHistory) log.append(bubble(m));
-        if (thinking) log.append(typingDots());
+        if (thinking) log.append(typingDots(looking ? "Looking at your screen…" : undefined));
         log.scrollTop = log.scrollHeight;
       }
 

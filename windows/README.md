@@ -208,6 +208,73 @@ If another program already owns the shortcut, Settings says so and lets you pick
 another. Turning voice off unregisters the shortcut, which is what makes the
 microphone unreachable.
 
+### Screen awareness
+
+Ask Mochi about what is on your screen ("what does this error mean?", "look at this
+code", "what am I looking at?") and it takes **one** screenshot, sends it with that
+request, and answers from it. A question that has nothing to do with the screen
+("what's the capital of France?", "2 + 2") never takes one. While it looks, the chat
+says "Looking at your screen…", and **Stop** ends it like any other request.
+
+**Coucou does not continuously monitor the screen.** There is no timer, no polling,
+no stream and no background capture; the screen is touched only inside a request you
+made, and while nothing is asked it costs nothing. Having the microphone shortcut
+does not capture anything either: a spoken request is only text, and goes through the
+same path as a typed one.
+
+- **How it is triggered.** The model asks for a look through one tool,
+  `capture_screen`, which has no parameters at all: no display, region, path or file.
+  What is captured is decided in Rust (`screen/`), never by the model. Your own
+  request is what authorises the capture, so there is no extra **Allow** for it. It
+  grants nothing else: a screenshot never lets the model do anything on your computer,
+  and any action it then proposes still needs your click on the **Allow / Deny** card.
+- **One per request.** At most one screenshot per message you send. A second call in
+  the same request is refused and the model is told so.
+- **Which display.** The one the foreground window is on (the island's own display
+  while you are typing to it), the one under the cursor if there is no foreground
+  window. Not every display, and not a window.
+- **Size limits** (`screen::LIMITS`, `MAX_REQUEST_BYTES`). A display of more than
+  36 million pixels is refused before anything is allocated. What is sent is shrunk to
+  at most 1568 px on its longest side and 1.15 million pixels, encoded as JPEG (quality
+  80, stepping down to 35 until it is at most 1.5 MB), and left out, with the model
+  told, if the whole request would still be over 8 MiB.
+- **Private.** The picture exists in memory only: captured, resized, encoded, put in
+  the one request that needs it, dropped. It is never written to disk, never logged
+  (the log says that a capture happened and how big it was, nothing from it), not
+  shown to the page, and not kept in the conversation: the history holds a note that a
+  screenshot was taken, so it is not sent again with later messages. It is, by
+  design, sent to Anthropic with your request, as an image, using the same key and
+  connection as the rest of the chat. Anything visible on that display (messages,
+  passwords, keys) is in it, and there is no reliable way to blank out part of a
+  picture, so look at what is on screen before you ask.
+- **Models.** Every current Claude model reads images. If the model chosen in
+  Settings cannot (Claude 2 and Instant, or anything that is not a Claude model), no
+  screenshot is taken and Mochi says so; the model is never switched behind your back.
+- **Off switch.** **Settings… → General → Look at my screen** turns it off. Then the
+  model's request is refused and it tells you how to turn it back on.
+- **Stop.** Stopping cancels a capture still under way, drops the picture and the
+  request that was waiting for it, sends nothing partial, leaves no file, and the next
+  message works as normal.
+- **If it fails** ("The screen could not be captured", "Windows did not allow
+  capturing the screen", "The screen is too large to capture") the model is told in
+  those words and carries on, usually by saying it could not see your screen. The
+  messages never include paths, system error codes or image data.
+- **Windows only for now.** Capture uses GDI (`platform/windows_capture.rs`); Linux
+  says the screen can't be captured on this system rather than pretending.
+
+Limits to know about: windows that exclude themselves from capture (some video, DRM
+and password-manager windows) come out black; the island itself can be in the picture
+if it covers part of the display; only one display is captured, so a window on another
+monitor is not seen; and text the model reads while answering (a web page it searched,
+a file you attached) could try to make it ask for the one look a request is allowed,
+which is why the look is always shown, stoppable, limited to one, and switchable off.
+
+`cargo test` covers the capture pipeline, the model turns and the privacy rules with a
+scripted model and screen. One test takes a real capture of the display it runs on and
+is skipped by default: `cargo test -p coucou --lib real_screen -- --ignored --nocapture`
+(add `--release` to see the real speed; it writes nothing unless
+`COUCOU_SCREEN_TEST_OUT` names a file).
+
 ### Idle resource use
 
 The island must cost nothing while hidden. [PERFORMANCE.md](PERFORMANCE.md) lists what

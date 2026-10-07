@@ -73,6 +73,10 @@ pub struct Settings {
     /// The speech-to-text service behind push-to-talk: "openai" or "groq".
     #[serde(default = "default_speech_provider")]
     pub speech_provider: String,
+    /// Whether Mochi may take a screenshot when the person's request is about their
+    /// screen. Off, the model is told it cannot and nothing is ever captured.
+    #[serde(default = "default_true")]
+    pub screen_awareness: bool,
 }
 
 fn default_model() -> String {
@@ -117,6 +121,7 @@ impl Default for Settings {
             wake_phrase_enabled: true,
             wake_phrase: default_wake_phrase(),
             speech_provider: default_speech_provider(),
+            screen_awareness: true,
         }
     }
 }
@@ -513,6 +518,13 @@ fn from_object(object: &Map<String, Value>, notes: &mut Vec<String>) -> Settings
             |v| v.as_str().map(String::from),
             d.speech_provider,
         ),
+        screen_awareness: field(
+            object,
+            "screenAwareness",
+            notes,
+            Value::as_bool,
+            d.screen_awareness,
+        ),
     };
     for name in sanitize(&mut s) {
         notes.push(format!("{name} was invalid or out of range; corrected"));
@@ -743,6 +755,7 @@ mod tests {
             wake_phrase_enabled: true,
             wake_phrase: default_wake_phrase(),
             speech_provider: default_speech_provider(),
+            screen_awareness: true,
         }
     }
 
@@ -1300,6 +1313,38 @@ mod tests {
         let loaded = load_from(&dir.0);
         assert_eq!(loaded.settings.speech_provider, "openai");
         assert!(loaded.notes.iter().any(|n| n.contains("speechProvider")), "{:?}", loaded.notes);
+    }
+
+    #[test]
+    fn screen_awareness_is_on_by_default_and_off_survives_a_save_and_a_reload() {
+        assert!(Settings::default().screen_awareness, "the person asking is what triggers a capture");
+        let dir = Dir::new("screen-roundtrip");
+        save_to(&dir.0, &Settings { screen_awareness: false, ..custom() }).unwrap();
+        let loaded = load_from(&dir.0);
+        assert!(!loaded.settings.screen_awareness);
+        assert!(loaded.notes.is_empty(), "{:?}", loaded.notes);
+        let on_disk: Value = serde_json::from_str(&dir.read()).unwrap();
+        assert_eq!(on_disk["screenAwareness"], false);
+    }
+
+    #[test]
+    fn a_file_from_before_screen_awareness_gets_the_default_without_a_fuss() {
+        let dir = Dir::new("v2-before-screen");
+        dir.put(r#"{ "version": 2, "voiceEnabled": false, "speechProvider": "groq" }"#);
+        let loaded = load_from(&dir.0);
+        assert!(loaded.settings.screen_awareness);
+        assert!(!loaded.settings.voice_enabled);
+        assert!(loaded.notes.is_empty(), "{:?}", loaded.notes);
+        assert_eq!(dir.names(), vec![FILE.to_string()], "nothing is rewritten, backed up or version-bumped");
+    }
+
+    #[test]
+    fn a_wrong_typed_screen_awareness_costs_only_itself() {
+        let dir = Dir::new("screen-badtype");
+        dir.put(r#"{ "version": 2, "soundEnabled": false, "screenAwareness": "no" }"#);
+        let s = load_from(&dir.0).settings;
+        assert!(s.screen_awareness, "back to the default");
+        assert!(!s.sound_enabled, "unrelated values survive");
     }
 
     #[test]

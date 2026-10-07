@@ -4,7 +4,10 @@
 // Everything happens here rather than in the island: the API key never leaves
 // the Credential Manager, and file bytes never cross the IPC boundary.
 
-use std::sync::Mutex;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -12,6 +15,7 @@ use serde_json::{json, Value};
 use crate::actions;
 use crate::assistant::{RawProposal, ToolResult};
 use crate::executor::Files;
+use crate::screen::{self, ScreenCapture, ScreenError, Screenshot};
 use crate::{files, http, log, secrets};
 
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
@@ -31,7 +35,7 @@ Respond in the user's language. Be thorough and complete — use as much detail 
 No markdown formatting (no **, no ##, no bullet dashes). Use plain text with line breaks. \
 You can also act on the user's computer, within narrow limits: when the user clearly asks you to open an application, a web page or a file they attached, call the propose_action tool. \
 Coucou shows the user exactly what you propose and does it only if they approve, then tells you how it went. Never say something has been done before you are told so. \
-If a request needs anything the tool cannot do, say so in plain words instead.";
+If a request needs anything the tool cannot do, say so in plain words instead. \nYou can also look at the user's screen: when their request is about what is on their screen (\"what am I looking at\", \"what does this error mean\", \"look at this code\"), call the capture_screen tool once, then answer from what you see. \nNever call it for a question that does not need the screen, and never more than once for a request. The screenshot shows the display they are working on and is not kept afterwards. \nIf the tool says it cannot take a screenshot, tell the user why in plain words.";
 
 #[derive(Default)]
 pub struct Chat {
@@ -94,20 +98,88 @@ pub struct ModelReply {
     pub proposal: Option<RawProposal>,
 }
 
+/// Where a turn is, as far as the island needs to say: looking at the screen, or back to
+/// the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    Capturing,
+    Thinking,
+}
+
+type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// What a turn needs from outside it: the model, and the screen. The real ones are
+/// `Live`; the tests use fakes, which is how a whole turn, capture included, is tested
+/// without a network or a display.
+pub(crate) trait Backend: Send + Sync {
+    /// One request to the model.
+    fn ask(&self, body: Value) -> BoxFuture<'_, Result<Value, String>>;
+    /// One screenshot. `cancel` is set if the turn is dropped, so a capture the person
+    /// stopped does not keep working.
+    fn look(&self, cancel: Arc<AtomicBool>) -> BoxFuture<'_, Result<Screenshot, ScreenError>>;
+}
+
+struct Live {
+    key: String,
+    screen: Arc<dyn ScreenCapture>,
+}
+
+impl Backend for Live {
+    fn ask(&self, body: Value) -> BoxFuture<'_, Result<Value, String>> {
+        Box::pin(async move { call(&self.key, &body).await })
+    }
+
+    fn look(&self, cancel: Arc<AtomicBool>) -> BoxFuture<'_, Result<Screenshot, ScreenError>> {
+        let screen = Arc::clone(&self.screen);
+        Box::pin(async move {
+            // Capturing and encoding take a moment of real work: off the async threads.
+            tauri::async_runtime::spawn_blocking(move || screen.capture(&cancel))
+                .await
+                .unwrap_or(Err(ScreenError::CaptureFailed))
+        })
+    }
+}
+
 /// One chat turn. Returns the assistant's text and any proposed action, or a
 /// message the island shows in the note view.
+///
+/// `screen` is the screen the model may ask to see (at most once in a turn), and
+/// `screen_on` whether the person has allowed that in Settings. `progress` is told when
+/// the turn is looking at the screen and when it goes back to the model.
+#[allow(clippy::too_many_arguments)]
 pub async fn send(
     chat: &Chat,
     model: &str,
     query: String,
     context: Option<ChatContext>,
     files: &Files,
+    screen: Arc<dyn ScreenCapture>,
+    screen_on: bool,
+    progress: &(dyn Fn(Stage) + Sync),
+) -> Result<ModelReply, String> {
+    let key = secrets::get("anthropic-api-key")
+        .ok_or_else(|| "API key missing. Open settings.".to_string())?;
+    let live = Live { key, screen };
+    send_with(&live, chat, model, query, context, files, screen_on, progress).await
+}
+
+/// `send` against any model and screen: the real ones above, fakes in the tests.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_with(
+    backend: &dyn Backend,
+    chat: &Chat,
+    model: &str,
+    query: String,
+    context: Option<ChatContext>,
+    files: &Files,
+    screen_on: bool,
+    progress: &(dyn Fn(Stage) + Sync),
 ) -> Result<ModelReply, String> {
     // Answers owed from the last turn go first. Unless the turn completes they are
     // put back, so the conversation stays one the API will accept; see `TurnGuard`.
     let owed = chat.take_tool_results();
     let mut guard = TurnGuard { chat, owed: owed.clone(), pushed: false, done: false };
-    send_turn(chat, model, query, context, files, &owed, &mut guard).await
+    send_turn(backend, chat, model, query, context, files, &owed, screen_on, progress, &mut guard).await
 }
 
 /// Keeps the conversation consistent however a turn ends. If the turn fails, or its
@@ -134,18 +206,28 @@ impl Drop for TurnGuard<'_> {
     }
 }
 
+/// Sets a flag when it goes out of scope, which includes the turn's future being dropped.
+struct StopOnDrop(Arc<AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn send_turn(
+    backend: &dyn Backend,
     chat: &Chat,
     model: &str,
     query: String,
     context: Option<ChatContext>,
     files: &Files,
     owed: &[ToolResult],
+    screen_on: bool,
+    progress: &(dyn Fn(Stage) + Sync),
     guard: &mut TurnGuard<'_>,
 ) -> Result<ModelReply, String> {
-    let key = secrets::get("anthropic-api-key")
-        .ok_or_else(|| "API key missing. Open settings.".to_string())?;
-
     let mut content: Vec<Value> = tool_result_blocks(owed);
 
     // File / window context rides along with the first message only, exactly
@@ -182,28 +264,45 @@ async fn send_turn(
     chat.push(json!({ "role": "user", "content": content }));
     guard.pushed = true;
 
-    let body = request_body(model, chat.snapshot());
-
     // From here an early return (or a dropped future) undoes the user message, via
     // the guard, so the history stays consistent with what the model saw.
-    let response = call(&key, &body).await?;
+    let response = backend.ask(request_body(model, chat.snapshot())).await?;
+    let first = content_of(&response)?;
 
-    // A policy decline comes back as HTTP 200 with stop_reason "refusal".
-    if response.get("stop_reason").and_then(Value::as_str) == Some("refusal") {
-        let why = response
-            .get("stop_details")
-            .and_then(|d| d.get("explanation"))
-            .and_then(Value::as_str)
-            .unwrap_or("Claude declined this one.");
-        return Err(why.to_string());
-    }
-
-    let Some(blocks) = response.get("content").and_then(Value::as_array).cloned() else {
-        return Err("Unexpected API response.".into());
+    // If the model asked to see the screen: take the one picture a request may have,
+    // send it in a second request, and answer from that. The picture lives only in that
+    // request. What is kept in the conversation says a screenshot was taken, not what
+    // it showed, so it is never sent again, never held, and never grows the history.
+    let (blocks, kept) = if asked_to_look(&first) {
+        let answers = answer_the_calls(backend, model, &first, screen_on, progress).await;
+        let mut messages = chat.snapshot();
+        messages.push(json!({ "role": "assistant", "content": first.clone() }));
+        messages.push(json!({ "role": "user", "content": answers.for_request }));
+        let mut body = request_body(model, messages);
+        if body.to_string().len() > screen::MAX_REQUEST_BYTES {
+            // Too heavy with the picture in it: send the answer without it, and say so.
+            let lighter = without_images(&answers.for_request);
+            let mut messages = chat.snapshot();
+            messages.push(json!({ "role": "assistant", "content": first.clone() }));
+            messages.push(json!({ "role": "user", "content": lighter }));
+            body = request_body(model, messages);
+        }
+        let response = backend.ask(body).await?;
+        let second = content_of(&response)?;
+        let kept = vec![
+            json!({ "role": "assistant", "content": first }),
+            json!({ "role": "user", "content": answers.for_history }),
+        ];
+        (second, kept)
+    } else {
+        (first, Vec::new())
     };
 
     // Store the whole content — tool_use / tool_result blocks included — so the
     // next turn has the right context. The exchange is kept from here on.
+    for message in kept {
+        chat.push(message);
+    }
     chat.push(json!({ "role": "assistant", "content": blocks.clone() }));
     guard.done = true;
 
@@ -219,13 +318,183 @@ async fn send_turn(
     Ok(ModelReply { text, proposal })
 }
 
+/// The content blocks of a reply, or why there are none.
+fn content_of(response: &Value) -> Result<Vec<Value>, String> {
+    // A policy decline comes back as HTTP 200 with stop_reason "refusal".
+    if response.get("stop_reason").and_then(Value::as_str) == Some("refusal") {
+        let why = response
+            .get("stop_details")
+            .and_then(|d| d.get("explanation"))
+            .and_then(Value::as_str)
+            .unwrap_or("Claude declined this one.");
+        return Err(why.to_string());
+    }
+    response
+        .get("content")
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| "Unexpected API response.".to_string())
+}
+
+struct ToolCall {
+    id: String,
+    name: String,
+    input: Value,
+}
+
+/// The client tool calls in a reply. A call with no id cannot be answered, and the API
+/// would not have produced one.
+fn tool_calls(blocks: &[Value]) -> Vec<ToolCall> {
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter_map(|b| {
+            Some(ToolCall {
+                id: b.get("id").and_then(Value::as_str)?.to_string(),
+                name: b.get("name").and_then(Value::as_str).unwrap_or("").to_string(),
+                input: b.get("input").cloned().unwrap_or(Value::Null),
+            })
+        })
+        .collect()
+}
+
+fn asked_to_look(blocks: &[Value]) -> bool {
+    tool_calls(blocks).iter().any(|call| call.name == screen::TOOL_NAME)
+}
+
+const NOT_RUN_YET: &str = "Not run: the screen was requested first. If this is still needed, ask again once you have looked.";
+const SECOND_LOOK: &str = "Only one screenshot is taken per request, so this one was not taken. Answer from the one you have.";
+const NO_ARGUMENTS: &str = "capture_screen takes no arguments, so no screenshot was taken.";
+const SCREEN_OFF: &str = "Screen awareness is turned off in Coucou's settings, so no screenshot was taken. Tell the user they can turn it on in Settings.";
+const NO_VISION: &str = "The selected model can't read images, so no screenshot was taken. Tell the user to choose a model that can, in Settings.";
+const TOO_BIG: &str = "The screenshot was too large to send, so it was left out. Tell the user.";
+/// What the conversation keeps in place of a screenshot.
+const KEPT: &str = "A screenshot was taken for this request. It is not kept.";
+
+/// The answers to a reply's tool calls: what the next request carries (the picture
+/// included) and what the conversation keeps (a note in its place).
+struct Answers {
+    for_request: Vec<Value>,
+    for_history: Vec<Value>,
+}
+
+fn text_result(id: &str, text: &str, is_error: bool) -> Value {
+    let mut result = json!({ "type": "tool_result", "tool_use_id": id, "content": text });
+    if is_error {
+        result["is_error"] = json!(true);
+    }
+    result
+}
+
+fn image_result(id: &str, shot: &Screenshot) -> Value {
+    json!({
+        "type": "tool_result",
+        "tool_use_id": id,
+        "content": [
+            { "type": "image", "source": { "type": "base64", "media_type": shot.media_type(), "data": base64(shot.jpeg()) } },
+            { "type": "text", "text": "This is the user's screen as it is right now." },
+        ],
+    })
+}
+
+/// The same results with any picture taken out and a reason put in its place.
+fn without_images(results: &[Value]) -> Vec<Value> {
+    results
+        .iter()
+        .map(|result| {
+            let has_image = result["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|p| p["type"] == "image"));
+            match (has_image, result["tool_use_id"].as_str()) {
+                (true, Some(id)) => text_result(id, TOO_BIG, true),
+                _ => result.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Answers every client tool call in `blocks`, as the API insists, and takes the
+/// screenshot if the model asked for one. A request gets one screenshot, and only the
+/// first call for it is honoured. Everything else the model called in the same message
+/// is not run: it is told so, and can ask again with the picture in front of it.
+async fn answer_the_calls(
+    backend: &dyn Backend,
+    model: &str,
+    blocks: &[Value],
+    screen_on: bool,
+    progress: &(dyn Fn(Stage) + Sync),
+) -> Answers {
+    let mut answers = Answers { for_request: Vec::new(), for_history: Vec::new() };
+    let mut taken = false;
+    for call in tool_calls(blocks) {
+        let (request, history) = if call.name != screen::TOOL_NAME {
+            let note = text_result(&call.id, NOT_RUN_YET, false);
+            (note.clone(), note)
+        } else if taken {
+            let note = text_result(&call.id, SECOND_LOOK, true);
+            (note.clone(), note)
+        } else {
+            taken = true;
+            match look_once(backend, model, &call, screen_on, progress).await {
+                Ok(shot) => (image_result(&call.id, &shot), text_result(&call.id, KEPT, false)),
+                Err(reason) => {
+                    let note = text_result(&call.id, &reason, true);
+                    (note.clone(), note)
+                }
+            }
+        };
+        answers.for_request.push(request);
+        answers.for_history.push(history);
+    }
+    answers
+}
+
+/// One screenshot, if it is allowed: the call has no arguments, the person has allowed
+/// it in Settings, and the model can read images. Otherwise the reason, written for the
+/// model to pass on. What went wrong is logged by kind, never with anything from the
+/// picture.
+async fn look_once(
+    backend: &dyn Backend,
+    model: &str,
+    call: &ToolCall,
+    screen_on: bool,
+    progress: &(dyn Fn(Stage) + Sync),
+) -> Result<Screenshot, String> {
+    if !screen::input_is_valid(&call.input) {
+        return Err(NO_ARGUMENTS.into());
+    }
+    if !screen_on {
+        return Err(SCREEN_OFF.into());
+    }
+    if !screen::model_accepts_images(model) {
+        return Err(NO_VISION.into());
+    }
+    progress(Stage::Capturing);
+    let cancel = Arc::new(AtomicBool::new(false));
+    // If the turn is dropped while the capture runs, the capture is told to stop.
+    let _stop = StopOnDrop(Arc::clone(&cancel));
+    let taken = backend.look(cancel).await;
+    progress(Stage::Thinking);
+    match taken {
+        Ok(shot) => {
+            log::line(format!("screen: captured {}x{} ({} KB)", shot.width, shot.height, shot.len().div_ceil(1024)));
+            Ok(shot)
+        }
+        Err(error) => {
+            log::line(format!("screen: {}", error.message()));
+            Err(format!("{} Tell the user.", error.message()))
+        }
+    }
+}
+
 /// The basic web search. The newer `web_search_20260209` filters results by running
 /// code, which the fallback model does not support, so with `"fallbacks": "default"`
 /// the API refuses the whole request before any model answers.
 const WEB_SEARCH_TOOL: &str = "web_search_20250305";
 
 /// The request for one turn: the conversation, the web search the model has always
-/// had, and the single tool through which it may ask Coucou to act.
+/// had, the tool through which it may ask Coucou to act, and the one through which it
+/// may ask to see the screen.
 pub(crate) fn request_body(model: &str, messages: Vec<Value>) -> Value {
     json!({
         "model": model,
@@ -234,6 +503,7 @@ pub(crate) fn request_body(model: &str, messages: Vec<Value>) -> Value {
         "tools": [
             { "type": WEB_SEARCH_TOOL, "name": "web_search", "max_uses": 5 },
             actions::tool_definition(),
+            screen::tool_definition(),
         ],
         "fallbacks": "default",
         "messages": messages,
@@ -273,12 +543,16 @@ pub(crate) fn interpret(blocks: &[Value]) -> Interpreted {
     for block in blocks.iter().filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_use")) {
         // A call with no id cannot be answered; the API would not have produced one.
         let Some(id) = block.get("id").and_then(Value::as_str) else { continue };
-        let is_ours = block.get("name").and_then(Value::as_str) == Some(actions::TOOL_NAME);
+        let name = block.get("name").and_then(Value::as_str);
+        let is_ours = name == Some(actions::TOOL_NAME);
         if is_ours && proposal.is_none() {
             proposal = Some(RawProposal { tool_use_id: id.to_string(), input: block.get("input").cloned().unwrap_or(Value::Null) });
         } else {
             let why = if is_ours {
                 "Only one action can be proposed at a time, so this one was not performed."
+            } else if name == Some(screen::TOOL_NAME) {
+                // Asked for after the one look this request gets: never a second capture.
+                SECOND_LOOK
             } else {
                 "That tool is not available, so nothing was done."
             };
@@ -446,6 +720,9 @@ fn base64(bytes: &[u8]) -> String {
 }
 
 #[cfg(test)]
+mod turn_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{base64, file_block_in, files, MAX_INLINE_TEXT};
     use std::path::{Path, PathBuf};
@@ -487,10 +764,12 @@ mod tests {
     }
 
     #[test]
-    fn the_request_offers_the_web_search_and_exactly_one_tool_for_acting() {
+    fn the_request_offers_the_web_search_one_tool_for_acting_and_one_for_seeing_the_screen() {
         let body = request_body("claude-opus-5", vec![]);
         let tools = body["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[2]["name"], crate::screen::TOOL_NAME);
+        assert_eq!(tools[2]["input_schema"]["additionalProperties"], false);
         assert_eq!(tools[0]["name"], "web_search");
         // Not the code-running variant: the fallback model rejects it (a live 400).
         assert_eq!(tools[0]["type"], "web_search_20250305");

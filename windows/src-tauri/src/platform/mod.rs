@@ -15,6 +15,14 @@ mod linux;
 #[cfg(target_os = "linux")]
 pub use self::linux::*;
 
+// Screen awareness: one picture of the display the person is working on.
+#[cfg(windows)]
+#[path = "windows_capture.rs"]
+pub mod capture;
+#[cfg(target_os = "linux")]
+#[path = "linux_capture.rs"]
+pub mod capture;
+
 // Push-to-talk: the global shortcut and the microphone.
 #[cfg(windows)]
 #[path = "windows_voice.rs"]

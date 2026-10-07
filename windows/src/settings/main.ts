@@ -414,6 +414,12 @@ function generalSection(): HTMLElement {
       h("label", { text: "Launch at startup" }),
       toggle(settings.autostart, (v) => { settings.autostart = v; void save(); }),
     ),
+    h("div", { class: "row" },
+      h("label", { text: "Look at my screen" }),
+      toggle(settings.screenAwareness, (v) => { settings.screenAwareness = v; void save(); }),
+      h("span", { class: "hint", text: "only when you ask about it" }),
+    ),
+    h("div", { class: "hint", text: "When a request is about what is on your screen, Mochi takes one screenshot of the display you are working on and sends it to Claude with that request. It is never saved, and nothing is captured at any other time." }),
   );
 }
 

@@ -102,6 +102,8 @@ export interface Settings {
   wakePhrase: string;
   /** Which speech-to-text service the recording is sent to. */
   speechProvider: "openai" | "groq";
+  /** Whether Mochi may look at the screen when a request is about it. */
+  screenAwareness: boolean;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -121,6 +123,7 @@ export const DEFAULT_SETTINGS: Settings = {
   wakePhraseEnabled: true,
   wakePhrase: "Hey Coucou",
   speechProvider: "openai",
+  screenAwareness: true,
 };
 
 /** Where a push-to-talk stands, as the island shows it. */
