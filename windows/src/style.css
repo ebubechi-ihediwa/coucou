@@ -1,3 +1,5 @@
+@import "./brand.css";
+
 /* Coucou for Windows — same palette, sizes and type scale as the macOS island.
    Every colour below is copied from the Swift views. */
 
@@ -7,22 +9,22 @@
   --font: system-ui, "Segoe UI Variable Text", "Segoe UI", "Segoe UI Emoji", sans-serif;
   --mono: "Cascadia Mono", "Consolas", ui-monospace, monospace;
 
-  --ink: #f5f6f8;        /* primary text */
+  --ink: var(--nimo-text-primary);
   --ink-2: #f1f2f4;
-  --dim: #9398a1;
+  --dim: var(--nimo-text-secondary);
   --dim-2: #8e939c;
   --dim-3: #6b7079;
   --dim-4: #5f646d;
   --dim-5: #4b5563;
-  --card: #141518;
+  --card: var(--nimo-surface-elevated);
   --card-flat: #0e0f11;
   --tab-on: #1d1f23;
-  --hairline: rgba(255, 255, 255, 0.035);
-  --red: #f4505e;
+  --hairline: var(--nimo-divider);
+  --red: var(--nimo-error);
   --red-text: #ff8d97;
-  --green: #22c55e;
+  --green: var(--nimo-success);
   --green-2: #34d399;
-  --amber: #f5a524;
+  --amber: var(--nimo-warning);
   --cyan: #22d3ee;
   --indigo: #6366f1;
   --pink: #f472b6;
@@ -69,7 +71,7 @@ body {
   position: absolute;
   top: 0;
   left: 50%;
-  background: #000;
+  background: var(--nimo-ink);
   border-radius: 0 0 14px 14px;
   overflow: visible;
   will-change: width, height, transform;
@@ -337,8 +339,17 @@ body {
 }
 
 .btn.primary {
-  background: var(--ink);
-  color: #0b0c0e;
+  background: var(--nimo-primary);
+  color: var(--nimo-ink);
+}
+
+.btn.primary:hover {
+  background: var(--nimo-primary-hover);
+}
+
+:focus-visible {
+  outline: 2px solid var(--nimo-focus);
+  outline-offset: 2px;
 }
 
 .btn.secondary {
@@ -891,12 +902,16 @@ input[type="range"]::-webkit-slider-thumb {
   flex: 0 0 28px;
   border: 0;
   border-radius: 50%;
-  background: var(--ink);
-  color: #0b0c0e;
+  background: var(--nimo-primary);
+  color: var(--nimo-ink);
   display: grid;
   place-items: center;
   cursor: default;
   transition: transform 0.08s ease-out;
+}
+
+.send-btn:hover:not(:disabled) {
+  background: var(--nimo-primary-hover);
 }
 
 .send-btn:active {

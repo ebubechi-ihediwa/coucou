@@ -103,7 +103,7 @@ function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
     );
   } else {
     actions.append(
-      h("button", { class: "link-btn", style: "color:#8e939c", text: "Settings…", onclick: openSettings }),
+      h("button", { class: "link-btn", style: "color:var(--nimo-text-secondary)", text: "Settings…", onclick: openSettings }),
     );
   }
 
@@ -247,7 +247,7 @@ function stripeCard(): HTMLElement {
         h("span", { class: "int-name", text: String(p.description ?? "Payment") }),
         h("span", {
           class: "int-amount",
-          style: "color:#22c55e",
+          style: "color:var(--nimo-success)",
           text: `+${(Number(p.amount ?? 0) / 100).toFixed(2)}`,
         }),
         h("span", { class: "int-ago", text: timeAgo(p.createdAt) }),

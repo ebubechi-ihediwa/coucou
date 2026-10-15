@@ -1,3 +1,5 @@
+@import "../brand.css";
+
 /* Settings window — same palette as the island, laid out as a normal window. */
 
 :root {
@@ -7,15 +9,15 @@
 
   --font: system-ui, "Segoe UI Variable Text", "Segoe UI", sans-serif;
   --mono: "Cascadia Mono", "Consolas", ui-monospace, monospace;
-  --ink: #f5f6f8;
-  --dim: #9398a1;
+  --ink: var(--nimo-text-primary);
+  --dim: var(--nimo-text-secondary);
   --dim-2: #6b7079;
-  --bg: #0b0c0e;
-  --card: #141518;
-  --hairline: rgba(255, 255, 255, 0.07);
-  --green: #22c55e;
-  --red: #f4505e;
-  --amber: #f5a524;
+  --bg: var(--nimo-surface-main);
+  --card: var(--nimo-surface-elevated);
+  --hairline: var(--nimo-border);
+  --green: var(--nimo-success);
+  --red: var(--nimo-error);
+  --amber: var(--nimo-warning);
 }
 
 * {
@@ -119,12 +121,12 @@ button:active:not(:disabled) {
 }
 
 button.primary {
-  background: var(--ink);
-  color: #0b0c0e;
+  background: var(--nimo-primary);
+  color: var(--nimo-ink);
 }
 
 button.primary:hover:not(:disabled) {
-  background: #fff;
+  background: var(--nimo-primary-hover);
 }
 
 button.danger {
@@ -133,7 +135,7 @@ button.danger {
 }
 
 button:disabled {
-  opacity: 0.45;
+  opacity: var(--nimo-disabled-opacity);
   cursor: default;
 }
 
@@ -211,7 +213,13 @@ input::placeholder {
 input:focus,
 select:focus {
   outline: none;
-  border-color: rgba(255, 255, 255, 0.28);
+  border-color: var(--nimo-focus);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--nimo-focus) 35%, transparent);
+}
+
+:focus-visible {
+  outline: 2px solid var(--nimo-focus);
+  outline-offset: 2px;
 }
 
 /* The popup is drawn by the OS: give it an explicit pair of colours rather than
