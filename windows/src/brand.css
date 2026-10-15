@@ -1,0 +1,23 @@
+/* Shared Nimo palette and the small set of semantic colors used by both windows. */
+:root {
+  --nimo-tangerine: #ff7a30;
+  --nimo-apricot: #ffad70;
+  --nimo-peach: #ffe3cc;
+  --nimo-warm-snow: #fff8f1;
+  --nimo-ink: #202027;
+
+  --nimo-primary: var(--nimo-tangerine);
+  --nimo-primary-hover: #e96521;
+  --nimo-focus: var(--nimo-apricot);
+  --nimo-text-primary: #f5f6f8;
+  --nimo-text-secondary: #9398a1;
+  --nimo-text-tertiary: #6b7079;
+  --nimo-surface-main: var(--nimo-ink);
+  --nimo-surface-elevated: #141518;
+  --nimo-border: rgba(255, 255, 255, 0.07);
+  --nimo-divider: rgba(255, 255, 255, 0.035);
+  --nimo-success: #22c55e;
+  --nimo-warning: #f5a524;
+  --nimo-error: #f4505e;
+  --nimo-disabled-opacity: 0.45;
+}
