@@ -127,7 +127,15 @@ export function buildPrompt(onHeightChange: () => void): ViewHost {
   }
 
   submitText = (text) => {
-    if (sending) return; // Rust refuses a push while a request is running; belt and braces
+    if (sending) {
+      // A spoken request is never queued behind another and never replaces it (Rust
+      // refuses a push while a request is running; this is for one typed meanwhile).
+      // It is dropped, and the person is told, so nothing is lost without a word.
+      State.noteMessage = "Coucou is still working on your last request.";
+      State.view = "note";
+      State.notify();
+      return;
+    }
     input.value = text;
     void submit();
   };
