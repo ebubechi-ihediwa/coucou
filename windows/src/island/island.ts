@@ -12,6 +12,7 @@ import {
 import { Sound } from "../core/sound";
 import { State } from "../core/state";
 import { BotEngine, hexToRGB } from "../mochi/engine";
+import { NimoMascot, type NimoClip } from "../mochi/nimo";
 import { Greeting } from "../mochi/greeting";
 import { createMiniBot, pruneMiniBots, syncMiniBotStates, tickMiniBots } from "../mochi/minibots";
 import { UploadCanvas } from "../upload/canvas";
@@ -59,6 +60,10 @@ export class Island {
   private botSize = new Spring(10);
 
   private engine = new BotEngine();
+  /** Nimo as video: stands in for the drawn body only while idle or listening. */
+  private nimo = new NimoMascot();
+  /** The bot is on screen at all (not hidden, greeting or drop sequence). */
+  private botVisible = false;
   private greeting = new Greeting();
 
   private running = false;
@@ -94,6 +99,7 @@ export class Island {
     this.wireFsm();
     this.wireInput();
     this.engine.onDizzy = () => this.handleDizzy();
+    this.nimo.onChange = () => this.applyBotOpacity();
     this.greeting.onComplete = () => this.fsm.greetComplete();
     State.subscribe(() => {
       this.dirty = true;
@@ -221,6 +227,7 @@ export class Island {
       this.clipEl,
       this.botGlow,
       this.botCanvas,
+      this.nimo.el,
       this.miniGrid,
       this.countdown,
     );
@@ -729,6 +736,7 @@ export class Island {
       // Kept running even while the drop canvas is up, so the island's own Mochi
       // is already in the right place the moment the canvas fades out.
       this.drawBot(dt);
+      this.syncNimo();
     }
 
     const uploadActive = this.uploadActive;
@@ -772,7 +780,8 @@ export class Island {
     const greetingActive = State.mode === "expanded" && State.view === "greeting";
     // The drop canvas draws its own Mochi; two of them would overlap.
     const visible = p.opacity > 0 && !greetingActive && !this.uploadActive;
-    this.botCanvas.style.opacity = visible ? "1" : "0";
+    this.botVisible = visible;
+    this.syncNimo();
 
     if (State.mode === "expanded" && State.view !== "uploading" && !greetingActive && !this.uploadActive) {
       const d = p.diameter;
@@ -787,6 +796,30 @@ export class Island {
     } else {
       this.botGlow.style.display = "none";
     }
+  }
+
+  /**
+   * Which Nimo clip, if any, stands in for the drawn body. Listening only while Rust has
+   * confirmed the microphone is capturing (State.voice, from the voice event), never
+   * because a button was pressed; idle only while the body is truly idling. Anything
+   * else (thinking, working, approval, errors, emotes, the file drop) keeps the drawing.
+   */
+  private syncNimo() {
+    let want: NimoClip | null = null;
+    if (this.botVisible && State.mode !== "hidden") {
+      if (State.voice.phase === "listening") want = "listening";
+      else if (State.effectiveState === "idle" && this.engine.plainIdle) want = "idle";
+    }
+    // Playing costs CPU, so the idle clip plays only while the island is open; in the compact
+    // pill it holds a still of Nimo. The listening clip only ever shows with the island open.
+    this.nimo.show(want, want === "idle" && State.mode !== "expanded");
+    this.nimo.place(this.botCx.value, this.botCy.value, this.botSize.value * 0.87);
+    this.applyBotOpacity();
+  }
+
+  private applyBotOpacity() {
+    this.botCanvas.style.opacity = this.botVisible && !this.nimo.showing ? "1" : "0";
+    this.nimo.el.style.opacity = this.botVisible && this.nimo.showing ? "1" : "0";
   }
 
   private drawBot(dt: number) {
@@ -901,6 +934,7 @@ export class Island {
 
     syncMiniBotStates(State.tasks);
     this.engine.setState(State.effectiveState);
+    this.syncNimo();
   }
 
   /** Applies settings coming from Rust at boot. */
