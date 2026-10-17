@@ -90,6 +90,25 @@ body {
   pointer-events: none;
 }
 
+/* Nimo, as video, stands in for the drawn body while idle or listening. Two clips are
+   stacked in one square; only the playing one is opaque. The square is placed by script
+   over the same spot as the canvas, so nothing around it moves when the clip changes. */
+#nimo {
+  position: absolute;
+  pointer-events: none;
+  opacity: 0;
+}
+#nimo .nimo-clip {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: transparent;
+  opacity: 0;
+  pointer-events: none;
+}
+
 /* The drop sequence. Sits under the header and takes over the island body; it
    cross-fades in and out, so the last frame stays up while the views return. */
 #upload-layer {

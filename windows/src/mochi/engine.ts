@@ -453,6 +453,19 @@ export class BotEngine {
   }
 
   /** True while anything is still moving — lets the island stop its RAF loop. */
+  /**
+   * Only idling: no emote, no particles, no file-eating morph and no other state under
+   * way. A replacement mascot may stand in for the body only while this holds.
+   */
+  get plainIdle(): boolean {
+    return (
+      this.state === "idle" &&
+      this.morph < 0.05 &&
+      this.particles.length === 0 &&
+      this.eyeOverrideUntil <= now()
+    );
+  }
+
   get busy(): boolean {
     return (
       this.tweens.size > 0 ||
